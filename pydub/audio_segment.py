@@ -1398,3 +1398,4 @@ class AudioSegment(object):
 
 
 from . import effects
+from . import noise_reduction

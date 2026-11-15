@@ -612,6 +612,39 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).reduce_noise()
+
+Frequency-domain noise reduction driven by a reference clip that contains only the noise to remove (for example, a short recording of steady air-conditioning hum). The reference clip's average power spectrum is estimated per channel and subtracted from every analysis frame with over-subtracting spectral subtraction. Requires [numpy](https://numpy.org/).
+
+The returned `AudioSegment` keeps the original frame rate, channel count, sample width and duration, so it can be concatenated, overlaid and exported like any other segment. An empty reference clip, or a `strength` of `0.0`, returns the segment unchanged.
+
+```python
+from pydub import AudioSegment
+
+voice_over = AudioSegment.from_file("narration.wav")
+# a short clip containing only the background hum
+noise_sample = AudioSegment.from_file("room_tone.wav")
+
+cleaned = voice_over.reduce_noise(noise_sample, strength=0.7)
+cleaned.export("narration_clean.wav", format="wav")
+```
+
+**Supported keyword arguments**:
+
+- `noise_clip` | required
+  An `AudioSegment` containing a sample of the noise. Must use the same frame rate and channel count as the processed segment. A different sample width is accepted and converted automatically.
+
+- `strength` | example: `0.9` | default: 0.7
+  A float between `0.0` and `1.0`. Higher values subtract more of the reference spectrum and apply a deeper attenuation floor, while spectral bins whose energy clearly exceeds the noise (such as voice fundamentals) are preserved.
+
+- `frame_size` | example: `1024` | default: 2048
+  STFT window length in samples. Must be an integer of at least 4.
+
+- `hop_size` | example: `256` | default: `frame_size // 4`
+  STFT hop length in samples (75% overlap by default). Must be between 1 and `frame_size`.
+
+Raises `ValueError` when `strength` is outside `[0.0, 1.0]`, the frame parameters are invalid, or the reference frame rate or channel count does not match the segment.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().
