@@ -363,6 +363,62 @@ no_crossfade2 = sound1 + sound2
 - `crossfade` | example: `3000` | default: `100` (entire duration of `AudioSegment`)
   When specified, method returns number of frames in X milliseconds of the `AudioSegment`
 
+### AudioSegment(…).seamless_loop()
+
+Builds a version of the segment that can be repeated without the click caused
+by the head and tail samples not lining up. The head and tail of the segment
+are each examined over a bounded window; the relative offset between the two
+cut positions is swept and every candidate is scored per channel on its
+waveform mismatch, the exact boundary pair crossed on each repeat, and its
+short-term energy gap. The chosen head is faded in and the chosen tail faded
+out with equal-power ramps whose outer endpoints are an exact gain of zero, so
+the wrap boundary of the returned period is silent on both sides and cannot
+click.
+
+Returns a `SeamlessLoop` namedtuple:
+
+- `segment` — the loopable `AudioSegment` (same sample rate, channel count and
+  sample width as the source)
+- `loop_start_sample` / `loop_end_sample` — the frame indices of the cut points
+  inside the source segment
+- `crossfade_samples` — crossfade length in frames
+- `loop_start_ms` / `loop_end_ms` — the same cut points in milliseconds
+
+The output period contains `loop_end_sample - loop_start_sample +
+crossfade_samples` frames: a faded-in head zone, the unmodified interior, and
+a faded-out tail zone.
+
+```python
+from pydub import AudioSegment
+ambience = AudioSegment.from_file("rain_ambience.wav")
+
+result = ambience.seamless_loop(search_window_ms=100, crossfade_ms=10)
+loop = result.segment
+
+# repeats smoothly; concatenating the period with itself is also click-free
+twice = loop + loop
+
+print("cut at frames", result.loop_start_sample, "to", result.loop_end_sample)
+```
+
+Raises a `ValueError` for empty audio, non-finite, non-numeric or non-positive
+parameters, a crossfade that is not shorter than the search window, or material
+with too few samples (the source must be longer than twice the search window so
+an uncrossfaded interior remains). The search only touches the bounded head and
+tail windows, so its memory use does not grow with the source length apart from
+the single output buffer.
+
+**Supported keyword arguments**:
+
+- `search_window_ms` | example: `100` | default: `100`
+  Size in milliseconds of the head and tail windows examined for the seam.
+- `crossfade_ms` | example: `10` | default: `10`
+  Length in milliseconds of the equal-power fade at the seam; must be shorter
+  than `search_window_ms`.
+- `energy_weight` | example: `2.0` | default: `1.0`
+  Weight of the energy-matching criterion relative to the waveform-mismatch
+  criteria (which have weight 1). Must be a finite non-negative number.
+
 ### AudioSegment(…).overlay()
 
 Overlays an `AudioSegment` onto this one. In the resulting `AudioSegment` they will play simultaneously. If the overlaid `AudioSegment` is longer than this one, the result will be truncated (so the end of the overlaid sound will be cut off). The result is always the same length as this `AudioSegment` even when using the `loop`, and `times` keyword arguments.

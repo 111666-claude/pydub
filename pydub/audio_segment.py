@@ -41,6 +41,7 @@ from .exceptions import (
     CouldntEncodeError,
     MissingAudioParameter,
 )
+from .looping import find_seamless_loop
 
 if sys.version_info >= (3, 0):
     basestring = str
@@ -1275,6 +1276,44 @@ class AudioSegment(object):
         obj = seg1._spawn(data=output)
         output.close()
         return obj
+
+    def seamless_loop(self, search_window_ms=100, crossfade_ms=10,
+                      energy_weight=1.0):
+        """
+        Build a seamlessly loopable version of this segment.
+
+        The head and tail are each examined over a window of
+        ``search_window_ms`` and the relative offset between the cut positions
+        is swept for the best per-channel waveform, boundary and energy match.
+        The chosen head is faded in and the tail faded out with ramps ending
+        on an exact gain of zero, returned as a period (faded-in head,
+        unmodified interior, faded-out tail), so repeating it stays smooth at
+        the wrap boundary instead of clicking.
+
+        Arguments:
+            search_window_ms (int): size of the head and tail search windows,
+                in milliseconds (default 100ms).
+            crossfade_ms (int): crossfade duration at the loop seam, in
+                milliseconds (default 10ms). Must be shorter than
+                ``search_window_ms``.
+            energy_weight (float): relative weight of the energy-continuity
+                criterion versus the waveform-mismatch criterion (default 1).
+
+        Returns:
+            SeamlessLoop: a namedtuple holding the loopable segment and the
+            frame/millisecond cut positions used.
+
+        Raises:
+            ValueError: for empty audio, invalid parameters, a crossfade
+                longer than the search window, or material too short for the
+                requested windows.
+        """
+        return find_seamless_loop(
+            self,
+            search_window_ms=search_window_ms,
+            crossfade_ms=crossfade_ms,
+            energy_weight=energy_weight,
+        )
 
     def fade(self, to_gain=0, from_gain=0, start=None, end=None,
              duration=None):

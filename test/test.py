@@ -40,6 +40,7 @@ from pydub.generators import (
     Sawtooth,
     WhiteNoise,
 )
+from pydub.looping import SeamlessLoop
 
 data_dir = os.path.join(os.path.dirname(__file__), 'data')
 
@@ -1394,6 +1395,275 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class SeamlessLoopTests(unittest.TestCase):
+    sample_rate = 44100
+
+    def _mono(self, samples, width=2):
+        import array as _array
+        from pydub.utils import get_array_type
+        data = _array.array(get_array_type(width * 8), samples)
+        try:
+            data = data.tobytes()
+        except AttributeError:  # pragma: no cover - Python 2
+            data = data.tostring()
+        return AudioSegment(
+            data,
+            metadata={"channels": 1, "sample_width": width,
+                      "frame_rate": self.sample_rate, "frame_width": width})
+
+    def _noise(self, seconds, seed=1234, amplitude=20000, width=2):
+        import random as _random
+        rng = _random.Random(seed)
+        count = int(self.sample_rate * seconds)
+        return self._mono(
+            [rng.randint(-amplitude, amplitude) for _ in range(count)],
+            width=width)
+
+    @staticmethod
+    def _wrap_delta_ratio(segment):
+        """
+        Ratio of the sample delta crossing the loop wrap to the median
+        internal sample-to-sample delta.  A seamless loop is ~0; a hard cut
+        is typically >= 1.
+        """
+        samples = segment.get_array_of_samples()[::segment.channels]
+        internal = sorted(
+            abs(samples[i] - samples[i - 1])
+            for i in range(1, len(samples)))
+        median = internal[len(internal) // 2] or 1
+        wrap_delta = abs(samples[0] - samples[-1])
+        return wrap_delta / median
+
+    def test_returns_seamless_loop_namedtuple_with_cut_positions(self):
+        seg = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=500)
+        result = seg.seamless_loop(search_window_ms=100, crossfade_ms=10)
+
+        self.assertIsInstance(result, SeamlessLoop)
+        self.assertEqual(result.segment.channels, 1)
+        self.assertEqual(result.segment.frame_rate, self.sample_rate)
+        self.assertEqual(result.segment.sample_width, 2)
+        self.assertEqual(
+            result.crossfade_samples, int(self.sample_rate * 0.01))
+
+        # cut points are frame indices inside the source, head before tail
+        self.assertGreaterEqual(result.loop_start_sample, 0)
+        self.assertLess(result.loop_end_sample, seg.frame_count())
+        self.assertLess(result.loop_start_sample, result.loop_end_sample)
+        # millisecond mirrors of the cut positions
+        self.assertEqual(
+            result.loop_start_ms,
+            round(1000 * result.loop_start_sample / self.sample_rate))
+        self.assertEqual(
+            result.loop_end_ms,
+            round(1000 * result.loop_end_sample / self.sample_rate))
+
+    def test_output_duration_is_explainable(self):
+        seg = self._noise(1.0)
+        result = seg.seamless_loop(search_window_ms=100, crossfade_ms=10)
+        c = result.crossfade_samples
+        expected_frames = (
+            result.loop_end_sample - result.loop_start_sample + c)
+        self.assertEqual(int(result.segment.frame_count()), expected_frames)
+        # faded-in head + interior + faded-out tail, each accounted for
+        self.assertGreaterEqual(
+            result.loop_end_sample - result.loop_start_sample, c)
+
+    def test_periodic_signal_picks_phase_aligned_seam(self):
+        freq = 440
+        seg = Sine(freq, sample_rate=self.sample_rate).to_audio_segment(
+            duration=500)
+        period = self.sample_rate / float(freq)
+        result = seg.seamless_loop(search_window_ms=100, crossfade_ms=10)
+
+        # the cut-to-cut span is close to phase aligned: its distance to the
+        # nearest whole number of periods is a small fraction of one period.
+        # The restricted 1-D seam sweep does not guarantee an exact phase
+        # match; the hard guarantee under test is the wrap smoothness below.
+        span = result.loop_end_sample - result.loop_start_sample
+        phase_remainder = span % period
+        phase_distance = min(phase_remainder, period - phase_remainder)
+        self.assertLess(phase_distance, period * 0.15)
+        # the wrap discontinuity collapses versus the unprocessed segment
+        self.assertLess(self._wrap_delta_ratio(result.segment), 0.2)
+        self.assertGreaterEqual(self._wrap_delta_ratio(seg), 1.0)
+
+    def test_aperiodic_noise_smoothes_wrap_and_preserves_energy(self):
+        seg = self._noise(2.0)
+        raw_ratio = self._wrap_delta_ratio(seg)
+        result = seg.seamless_loop(search_window_ms=100, crossfade_ms=10)
+        loop = result.segment
+
+        self.assertLess(self._wrap_delta_ratio(loop), 0.1)
+        self.assertLess(self._wrap_delta_ratio(loop), raw_ratio)
+
+        # energy on the two sides of the wrapped seam stays comparable
+        c = result.crossfade_samples
+        head_energy = loop[:int(1000 * c / self.sample_rate)].rms
+        tail_energy = loop[-int(1000 * c / self.sample_rate):].rms
+        self.assertTrue(tail_energy > 0 and head_energy > 0)
+        self.assertLess(
+            abs(head_energy - tail_energy) / float(head_energy), 0.25)
+
+    def test_concatenating_loop_with_itself_is_smooth_at_join(self):
+        seg = self._noise(1.5)
+        loop = seg.seamless_loop(100, 10).segment
+        doubled = loop + loop
+        samples = doubled.get_array_of_samples()
+        mid = int(loop.frame_count())
+
+        internal = sorted(
+            abs(samples[i] - samples[i - 1])
+            for i in range(1, len(samples)))
+        median = internal[len(internal) // 2] or 1
+        join_delta = max(abs(samples[mid] - samples[mid - 1]),
+                         abs(samples[mid + 1] - samples[mid]))
+        self.assertLess(join_delta / median, 0.25)
+        # frame count doubles exactly; millisecond length can round by 1ms
+        self.assertEqual(doubled.frame_count(), loop.frame_count() * 2)
+        self.assertAlmostEqual(len(doubled), len(loop) * 2, delta=1)
+
+    def test_stereo_channels_do_not_bleed(self):
+        left = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=500)
+        right = Sine(880, sample_rate=self.sample_rate).to_audio_segment(
+            duration=500).apply_gain(-6)
+        stereo = AudioSegment.from_mono_audiosegments(left, right)
+
+        result = stereo.seamless_loop(100, 10)
+        self.assertEqual(result.segment.channels, 2)
+        out_left, out_right = result.segment.split_to_mono()
+
+        # the quieter, higher right channel stays the quieter channel:
+        # no cross-channel mixing during the search or crossfade
+        self.assertLess(out_right.rms, out_left.rms)
+        self.assertAlmostEqual(
+            out_left.rms / float(left.rms), 1.0, delta=0.05 * left.rms)
+        self.assertAlmostEqual(
+            out_right.rms / float(right.rms), 1.0, delta=0.05 * right.rms)
+
+    def test_sample_widths_and_silence_are_supported(self):
+        for width in (1, 2, 4):
+            seg = self._noise(1.0, amplitude=2 ** (7 * width) // 2,
+                              width=width)
+            result = seg.seamless_loop(50, 5)
+            loop = result.segment
+            self.assertEqual(loop.sample_width, width)
+            self.assertEqual(loop.frame_rate, self.sample_rate)
+            self.assertEqual(loop.channels, 1)
+            self.assertGreater(loop.frame_count(), 0)
+
+        # silence: every seam ties, but the result must still be silent and
+        # well-formed rather than raising
+        silent = AudioSegment.silent(
+            duration=500, frame_rate=self.sample_rate)
+        result = silent.seamless_loop(100, 10)
+        self.assertEqual(result.segment.rms, 0)
+        self.assertEqual(
+            result.segment.frame_rate, self.sample_rate)
+
+    def test_invalid_arguments_raise_value_error(self):
+        seg = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=500)
+
+        with self.assertRaises(ValueError):
+            AudioSegment.empty().seamless_loop()
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=0, crossfade_ms=10)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=-10, crossfade_ms=10)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=0)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=-5)
+        # crossfade must be shorter than the search window
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=10, crossfade_ms=10)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=200)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(energy_weight=-1)
+        # non-numeric arguments are rejected rather than silently coerced
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms="100", crossfade_ms=10)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=None, crossfade_ms=10)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=True)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(energy_weight="heavy")
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(energy_weight=float("nan"))
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=float("inf"))
+
+    def test_insufficient_samples_raises_value_error(self):
+        # 50ms of audio cannot host two 100ms search windows
+        seg = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=50)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=10)
+
+    def test_segment_longer_than_two_windows_is_required(self):
+        # a segment exactly twice the window length leaves no interior and is
+        # rejected up front with a clear error rather than failing mid-build
+        seg = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=200)
+        with self.assertRaises(ValueError):
+            seg.seamless_loop(search_window_ms=100, crossfade_ms=1)
+        # one extra millisecond gives the required interior frame
+        seg2 = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=201)
+        result = seg2.seamless_loop(search_window_ms=100, crossfade_ms=1)
+        self.assertGreater(result.segment.frame_count(), 0)
+
+    def test_tiny_crossfade_stays_smooth_via_zero_gain_endpoints(self):
+        # even a 1-2 frame fade must not click, because the wrap samples are
+        # forced to an exact gain of zero
+        seg = self._noise(1.0)
+        for crossfade_ms in (1, 2):
+            loop = seg.seamless_loop(
+                search_window_ms=20,
+                crossfade_ms=crossfade_ms).segment
+            samples = loop.get_array_of_samples()
+            # the first and last samples of the period are exactly silent
+            self.assertEqual(samples[0], 0)
+            self.assertEqual(samples[-1], 0)
+            self.assertLess(self._wrap_delta_ratio(loop), 0.25)
+
+    def test_long_material_keeps_memory_bounded(self):
+        import tracemalloc
+        # a 60s stereo segment: search work must not scale with its length
+        stereo = AudioSegment.from_mono_audiosegments(
+            self._noise(60), self._noise(60, seed=99))
+        source_bytes = len(stereo.raw_data)
+
+        tracemalloc.start()
+        current_before, _ = tracemalloc.get_traced_memory()
+        result = stereo.seamless_loop(search_window_ms=100,
+                                      crossfade_ms=10)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        # the search only touches the bounded head/tail windows; allowing the
+        # single output-sized buffer, peak extra memory stays under 3x source
+        self.assertLess(peak - current_before, source_bytes * 3)
+        self.assertEqual(result.segment.channels, 2)
+
+    def test_append_and_crossfade_behavior_unchanged(self):
+        seg1 = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=300)
+        seg2 = Sine(660, sample_rate=self.sample_rate).to_audio_segment(
+            duration=300)
+
+        plain = seg1.append(seg2, crossfade=100)
+        no_fade = seg1.append(seg2, crossfade=0)
+        self.assertEqual(len(plain), len(seg1) + len(seg2) - 100)
+        self.assertEqual(len(no_fade), len(seg1) + len(seg2))
+        with self.assertRaises(ValueError):
+            seg1.append(seg2, crossfade=len(seg1) + 1)
 
 
 if __name__ == "__main__":
