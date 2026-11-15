@@ -187,6 +187,218 @@ def compress_dynamic_range(seg, threshold=-20.0, ratio=4.0, attack=5.0, release=
     return seg._spawn(data=b''.join(output))
 
 
+def _gate_number(name, value, allow_infinity=False, minimum=None):
+    """
+    Validate a numeric argument for :func:`noise_gate`.
+
+    Returns the value converted to float so callers can do arithmetic without
+    worrying about ints, Decimals, etc.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a number, got %r" % (name, value))
+
+    if math.isnan(value):
+        raise ValueError("%s must not be NaN" % name)
+
+    if math.isinf(value) and not allow_infinity:
+        raise ValueError("%s must be finite, got %r" % (name, value))
+
+    if minimum is not None and value < minimum:
+        raise ValueError("%s must be >= %s, got %r" % (name, minimum, value))
+
+    return value
+
+
+@register_pydub_effect
+def noise_gate(seg, open_threshold=-40.0, close_threshold=-45.0,
+               attack=5.0, hold=50.0, release=100.0, attenuation=40.0):
+    """
+    Attenuate the input whenever it falls below a threshold, while leaving
+    speech (and other loud passages) untouched.
+
+    Unlike cutting out silent chunks, a gate keeps every frame and simply
+    scales it. Frames are never dropped, so the duration, frame rate and
+    sample width of the returned segment are the same as the input. Gain is
+    applied equally to every channel of a frame and never exceeds 1.0, so
+    channels keep their relative levels and phase, and the effect cannot
+    introduce clipping.
+
+    Keyword Arguments:
+
+        open_threshold - default: -40.0
+            Level in dBFS at which the gate starts to open. While the gate is
+            closed the input must reach this level to open it. Use
+            ``float("inf")`` to keep the gate permanently closed, or
+            ``float("-inf")`` to keep it permanently open.
+
+        close_threshold - default: -45.0
+            Level in dBFS below which the gate starts to close. It must not be
+            higher than ``open_threshold``. The gap between the two thresholds
+            is the hysteresis band, which stops the gate from chattering when
+            the input hovers around a single level.
+
+        attack - default: 5.0
+            Time in milliseconds for the gain to reach unity after the gate
+            opens. A value of 0 opens within one level-detection block (about
+            1 ms), which still avoids a sample discontinuity.
+
+        hold - default: 50.0
+            Time in milliseconds the gate stays open after the input drops
+            below ``close_threshold``. This keeps short gaps between words
+            (and the tail of a word) from being attenuated. The hold timer is
+            restarted whenever the input rises back above
+            ``close_threshold``.
+
+        release - default: 100.0
+            Time in milliseconds for the gain to fall to ``attenuation`` after
+            the hold time has elapsed. A value of 0 closes within one
+            level-detection block (about 1 ms).
+
+        attenuation - default: 40.0
+            How much gain (in dB) is removed while the gate is closed. Use
+            ``float("inf")`` to mute gated audio completely, or 0 to make the
+            effect a no-op. Negative values are not allowed.
+
+    Level detection:
+
+        The level is the RMS of every channel of the audio, measured once per
+        millisecond. It is compared to the thresholds before the gain is
+        updated, and the resulting gain is applied to every channel of a
+        frame. Multichannel audio is therefore gated as a unit: a loud channel
+        opens the gate for all channels, and the ratio between channels (and
+        their phase) is unchanged. Gain moves linearly across each millisecond
+        block, so the envelope has no steps at block boundaries.
+
+    A segment that begins above ``open_threshold`` starts with the gate open,
+    so leading speech is not faded in. A segment that begins below it starts
+    closed. Empty segments are returned unchanged.
+    """
+    open_threshold = _gate_number("open_threshold", open_threshold,
+                                  allow_infinity=True)
+    close_threshold = _gate_number("close_threshold", close_threshold,
+                                   allow_infinity=True)
+    attack = _gate_number("attack", attack, minimum=0.0)
+    hold = _gate_number("hold", hold, minimum=0.0)
+    release = _gate_number("release", release, minimum=0.0)
+    attenuation = _gate_number("attenuation", attenuation,
+                               allow_infinity=True, minimum=0.0)
+
+    if close_threshold > open_threshold:
+        raise ValueError(
+            "close_threshold (%s) must not be higher than "
+            "open_threshold (%s); the gate needs a hysteresis band"
+            % (close_threshold, open_threshold))
+
+    frame_count = int(seg.frame_count())
+    if frame_count == 0:
+        return seg
+
+    open_level = db_to_float(open_threshold)
+    close_level = db_to_float(close_threshold)
+    closed_gain = db_to_float(-attenuation)
+
+    frame_rate = seg.frame_rate
+    frame_width = seg.frame_width
+    sample_width = seg.sample_width
+    max_amplitude = float(seg.max_possible_amplitude)
+
+    # Attack/release/hold are expressed in frames. Rounding keeps the
+    # requested time as close as possible to the requested millisecond value.
+    attack_frames = int(round(frame_rate * attack / 1000.0))
+    hold_frames = int(round(frame_rate * hold / 1000.0))
+    release_frames = int(round(frame_rate * release / 1000.0))
+
+    # Level is measured over 1 ms blocks. That is fine-grained enough to
+    # resolve short attack/hold times while keeping the detector cheap, and it
+    # gives every block (rather than every sample) the same weight, so the
+    # level of dense and sparse audio is comparable.
+    block_frames = max(1, int(round(frame_rate / 1000.0)))
+    block_count = int(math.ceil(frame_count / float(block_frames)))
+    raw_data = seg._data
+
+    # Walk the gate state block by block. The gain moves linearly across each
+    # block, so the envelope has no discontinuities at block boundaries.
+    out = []
+    prev_gain = None
+    gate_open = False
+    hold_remaining = 0
+
+    for block_i in xrange(block_count):
+        start_frame = block_i * block_frames
+        end_frame = min(start_frame + block_frames, frame_count)
+        block_len = end_frame - start_frame
+
+        block_data = raw_data[start_frame * frame_width:end_frame * frame_width]
+        level = audioop.rms(block_data, sample_width) / max_amplitude
+
+        if prev_gain is None:
+            # Prime the envelope from the first block instead of ramping up
+            # from silence, which would fade in the beginning of the segment.
+            gate_open = level >= open_level
+            hold_remaining = hold_frames if gate_open else 0
+            prev_gain = 1.0 if gate_open else closed_gain
+
+        if level >= open_level:
+            gate_open = True
+            hold_remaining = hold_frames
+        elif gate_open:
+            if level >= close_level:
+                # Still inside the hysteresis band: restart the hold timer.
+                hold_remaining = hold_frames
+            else:
+                hold_remaining -= block_len
+                if hold_remaining <= 0:
+                    hold_remaining = 0
+                    gate_open = False
+
+        target_gain = 1.0 if gate_open else closed_gain
+
+        gain = prev_gain
+        if target_gain > gain:
+            if attack_frames > 0:
+                gain = min(target_gain,
+                           prev_gain + block_len * (1.0 - closed_gain) /
+                           attack_frames)
+            else:
+                gain = target_gain
+        elif target_gain < gain:
+            if release_frames > 0:
+                gain = max(target_gain,
+                           prev_gain - block_len * (1.0 - closed_gain) /
+                           release_frames)
+            else:
+                gain = target_gain
+
+        if gain == prev_gain:
+            # Constant-gain blocks are scaled in one C call (or, at unity,
+            # copied verbatim so ungated audio stays bit-for-bit identical).
+            if gain == 1.0:
+                out.append(block_data)
+            elif gain == 0.0:
+                out.append(b'\0' * len(block_data))
+            else:
+                out.append(audioop.mul(block_data, sample_width, gain))
+        else:
+            # Ramp blocks are scaled frame by frame so the gain glides from
+            # prev_gain to gain instead of stepping at the block boundary.
+            block_start = start_frame * frame_width
+            delta = (gain - prev_gain) / block_len
+            for frame_i in xrange(block_len):
+                frame_gain = prev_gain + delta * (frame_i + 1)
+                frame_start = block_start + frame_i * frame_width
+                frame = raw_data[frame_start:frame_start + frame_width]
+                if frame_gain == 0.0:
+                    out.append(b'\0' * frame_width)
+                else:
+                    out.append(audioop.mul(frame, sample_width, frame_gain))
+
+        prev_gain = gain
+
+    return seg._spawn(data=b''.join(out))
+
+
 # Invert the phase of the signal.
 
 @register_pydub_effect

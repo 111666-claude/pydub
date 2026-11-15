@@ -612,6 +612,72 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).noise_gate()
+
+Attenuate background noise (hiss, room tone, fan noise) without cutting audio
+out. Unlike trimming silence, every frame is kept — quiet frames are simply
+scaled down — so the duration, frame rate, sample rate and sample width of the
+result are identical to the input.
+
+```python
+from pydub import AudioSegment
+
+interview = AudioSegment.from_file("interview.wav")
+# Attenuate everything below -40 dBFS by 40 dB, ignoring pauses shorter
+# than 150 ms
+cleaner = interview.noise_gate(open_threshold=-40,
+                               close_threshold=-45,
+                               hold=150)
+
+# Mute gated audio completely instead of attenuating it
+muted = interview.noise_gate(attenuation=float("inf"))
+```
+
+Two thresholds provide hysteresis: the gate opens when the level reaches
+`open_threshold` and only starts to close once the level falls below
+`close_threshold`. With `close_threshold` lower than `open_threshold` a signal
+dithering around a single level does not make the gate switch on and off
+repeatedly.
+
+The detector uses the RMS of all channels, so multichannel audio is gated as a
+unit: a loud channel opens the gate for every channel. The same gain is applied
+to every channel of a frame, which preserves the relative volume and phase
+between channels. Gain never exceeds 1.0, so the effect cannot clip.
+
+**Supported keyword arguments**:
+
+- `open_threshold` | example: `-30` | default: -40.0
+  Level in dBFS at which the gate starts to open. While the gate is closed the
+  input must reach this level to open it.
+
+- `close_threshold` | example: `-40` | default: -45.0
+  Level in dBFS below which the gate starts to close once the hold has
+  elapsed. Must not be higher than `open_threshold`. Set the two thresholds
+  equal to disable hysteresis.
+
+- `attack` | example: `10` | default: 5.0
+  Time in milliseconds for the gain to rise from the closed level to unity
+  after the gate opens. Must be >= 0; 0 opens within one level-detection block
+  (about 1 ms).
+
+- `hold` | example: `150` | default: 50.0
+  Time in milliseconds the gate stays open after the level drops below
+  `close_threshold`. This preserves short pauses between words and the tails
+  of words. Must be >= 0.
+
+- `release` | example: `200` | default: 100.0
+  Time in milliseconds for the gain to fall to `attenuation` after the hold
+  time has elapsed. Must be >= 0; 0 closes within one level-detection block
+  (about 1 ms).
+
+- `attenuation` | example: `60` | default: 40.0
+  How much gain in dB is removed while the gate is closed. Use
+  `float("inf")` for complete silence or `0` for a no-op. Must be >= 0.
+
+A segment that begins above `open_threshold` starts with the gate open so
+leading speech is not faded in; one that begins below it starts closed. Empty
+segments are returned unchanged. Invalid arguments raise `ValueError`.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

@@ -1,3 +1,9 @@
+# Unreleased
+- Add `pydub.AudioSegment().noise_gate()` for attenuating steady background
+  noise without cutting audio. Supports separate open/close thresholds
+  (hysteresis), attack, hold, release and an attenuation amount, and works with
+  any sample width and channel count while preserving the segment's duration.
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

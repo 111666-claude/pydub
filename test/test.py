@@ -1154,6 +1154,241 @@ class SilenceTests(unittest.TestCase):
             prev_end = end
 
 
+class NoiseGateTests(unittest.TestCase):
+    """
+    Synthetic "speech" is a loud tone burst followed by a quiet noise floor,
+    which mirrors a recording with a constant background hiss.
+    """
+
+    def setUp(self):
+        self.frame_rate = 8000
+        self.tone = Sine(500, sample_rate=self.frame_rate).to_audio_segment(
+            duration=100, volume=-6)
+        self.noise = WhiteNoise(sample_rate=self.frame_rate).to_audio_segment(
+            duration=200, volume=-60)
+        # tone, 200 ms of noise floor, tone, 200 ms of noise floor, tone
+        self.speech = (self.tone + self.noise) * 2 + self.tone
+
+    def gain_at(self, original, gated, ms, window=2):
+        before = original[ms:ms + window].rms
+        after = gated[ms:ms + window].rms
+        return after / float(before) if before else None
+
+    def test_preserves_duration_and_format(self):
+        for channels in (1, 2):
+            for sample_width in (1, 2, 4):
+                seg = self.speech.set_channels(channels).set_sample_width(
+                    sample_width)
+                gated = seg.noise_gate()
+                self.assertEqual(len(gated), len(seg))
+                self.assertEqual(gated.frame_rate, seg.frame_rate)
+                self.assertEqual(gated.channels, channels)
+                self.assertEqual(gated.sample_width, sample_width)
+                self.assertEqual(gated.frame_count(), seg.frame_count())
+
+    def test_loud_parts_pass_through_unchanged(self):
+        gated = self.speech.noise_gate(
+            open_threshold=-30, close_threshold=-35)
+        # The very beginning of a segment starting loud must not fade in.
+        self.assertEqual(self.gain_at(self.speech, gated, 0), 1.0)
+        self.assertAlmostEqual(self.gain_at(self.speech, gated, 50), 1.0,
+                               places=2)
+
+    def test_noise_floor_is_attenuated(self):
+        # Use a noise floor that is quiet but still well above 16-bit
+        # quantization, so the measured gain is not dominated by rounding.
+        noise = WhiteNoise(sample_rate=self.frame_rate).to_audio_segment(
+            duration=200, volume=-30)
+        speech = (self.tone + noise) * 2 + self.tone
+
+        gated = speech.noise_gate(
+            open_threshold=-15, close_threshold=-20, hold=0, release=10,
+            attenuation=60)
+        # well inside the 200 ms noise floor, the gate is fully closed
+        self.assertLessEqual(self.gain_at(speech, gated, 150, window=20),
+                             db_to_float(-60) * 1.1)
+
+        with_attenuation = speech.noise_gate(
+            open_threshold=-15, close_threshold=-20, hold=0, release=10,
+            attenuation=20)
+        gain = self.gain_at(speech, with_attenuation, 150, window=20)
+        self.assertAlmostEqual(gain, db_to_float(-20), places=2)
+
+    def test_short_pause_is_held_open(self):
+        # A 40 ms gap between two words should survive a 50 ms hold.
+        short_gap = WhiteNoise(sample_rate=self.frame_rate).to_audio_segment(
+            duration=40, volume=-60)
+        seg = self.tone + short_gap + self.tone
+        gated = seg.noise_gate(
+            open_threshold=-30, close_threshold=-35, attack=1, hold=50,
+            release=5, attenuation=60)
+
+        # both words are untouched and the gap between them is not gated away
+        for ms in (10, 95, 125, 160):
+            self.assertAlmostEqual(self.gain_at(seg, gated, ms), 1.0,
+                                   places=2)
+
+        # without the hold the same gap is attenuated
+        without_hold = seg.noise_gate(
+            open_threshold=-30, close_threshold=-35, attack=1, hold=0,
+            release=1, attenuation=60)
+        self.assertLess(self.gain_at(seg, without_hold, 125), 0.1)
+
+    def test_attack_and_release_ramp(self):
+        # A deterministic quiet floor makes the measured gain stable (white
+        # noise would make the ratio in the quiet part fluctuate).
+        floor = Sine(200, sample_rate=self.frame_rate).to_audio_segment(
+            duration=200, volume=-50)
+        speech = floor + self.tone + floor
+        gated = speech.noise_gate(
+            open_threshold=-30, close_threshold=-35, attack=40, hold=0,
+            release=100, attenuation=60)
+
+        # 200 ms of floor, then the tone starts at 200 ms. The gain ramps up
+        # over the attack time instead of jumping straight to unity.
+        attack_gains = [self.gain_at(speech, gated, 200 + ms, window=5)
+                        for ms in (0, 10, 20, 35, 60)]
+        self.assertLess(attack_gains[0], 0.5)
+        self.assertLess(attack_gains[0], attack_gains[1])
+        self.assertLess(attack_gains[1], attack_gains[2])
+        self.assertLess(attack_gains[2], attack_gains[3])
+        self.assertEqual(attack_gains[-1], 1.0)
+
+        # the tone ends at 300 ms; release glides back down
+        release_gains = [self.gain_at(speech, gated, 300 + ms, window=5)
+                         for ms in (5, 15, 30, 45, 65)]
+        self.assertGreater(release_gains[0], 0.5)
+        self.assertGreater(release_gains[0], release_gains[1])
+        self.assertGreater(release_gains[1], release_gains[2])
+        self.assertGreater(release_gains[2], release_gains[3])
+        self.assertLess(release_gains[-1], 0.5)
+
+        # release eventually reaches the requested attenuation
+        self.assertLess(self.gain_at(speech, gated, 450, window=5), 0.01)
+
+    def test_hysteresis_prevents_chatter(self):
+        # A steady tone whose level sits in the band between the thresholds:
+        # with hysteresis closed the gate stays closed.
+        between = Sine(500, sample_rate=self.frame_rate).to_audio_segment(
+            duration=500, volume=-30)  # about -33 dBFS
+        gated = between.noise_gate(
+            open_threshold=-30, close_threshold=-36, attack=0, hold=0,
+            release=0, attenuation=60)
+        self.assertEqual(gated.rms, 0)
+
+        # but once opened by a loud passage, the same level keeps it open
+        seg = self.tone + between
+        gated = seg.noise_gate(
+            open_threshold=-30, close_threshold=-36, attack=0, hold=0,
+            release=0, attenuation=60)
+        self.assertGreater(self.gain_at(seg, gated, 300), 0.9)
+
+    def test_multichannel_gates_as_a_unit(self):
+        # Right is 30 dB quieter than left; the gate opens because of the
+        # combined level, and both channels get exactly the same gain.
+        left = Sine(500, sample_rate=self.frame_rate).to_audio_segment(
+            duration=300, volume=-6)
+        right = Sine(500, sample_rate=self.frame_rate).to_audio_segment(
+            duration=300, volume=-36)
+        stereo = AudioSegment.from_mono_audiosegments(left, right)
+
+        gated = stereo.noise_gate(open_threshold=-20, close_threshold=-25)
+        gated_left, gated_right = gated.split_to_mono()
+        self.assertAlmostEqual(gated_left.rms / float(left.rms), 1.0,
+                               places=2)
+        self.assertAlmostEqual(gated_right.rms / float(right.rms), 1.0,
+                               places=2)
+
+        # both channels are gated together by the same factor
+        quiet_stereo = AudioSegment.from_mono_audiosegments(
+            left.apply_gain(-50), right.apply_gain(-50))
+        gated = quiet_stereo.noise_gate(
+            open_threshold=-20, close_threshold=-25, attenuation=40)
+        gated_left, gated_right = gated.split_to_mono()
+        self.assertAlmostEqual(
+            gated_left.rms / float(quiet_stereo.split_to_mono()[0].rms),
+            gated_right.rms / float(quiet_stereo.split_to_mono()[1].rms),
+            places=3)
+
+    def test_empty_and_silent_segments(self):
+        empty = AudioSegment.empty()
+        self.assertEqual(len(empty.noise_gate()), 0)
+
+        silent = AudioSegment.silent(500, frame_rate=self.frame_rate)
+        gated = silent.noise_gate()
+        self.assertEqual(len(gated), len(silent))
+        self.assertEqual(gated.rms, 0)
+
+        # A near-zero DC offset is still treated as silence and stays stable.
+        quiet = AudioSegment.silent(
+            500, frame_rate=self.frame_rate).apply_gain(-0.0000001)
+        gated = quiet.noise_gate()
+        self.assertEqual(len(gated), len(quiet))
+        self.assertEqual(gated.rms, 0)
+
+    def test_invalid_arguments(self):
+        seg = self.tone
+        for kwargs in (
+            dict(open_threshold="loud"),
+            dict(open_threshold=float("nan")),
+            dict(attack=-1),
+            dict(hold=-1),
+            dict(release=-1),
+            dict(attenuation=-1),
+            dict(open_threshold=-50, close_threshold=-40),
+        ):
+            self.assertRaises(ValueError, partial(seg.noise_gate, **kwargs))
+
+    def test_infinite_thresholds(self):
+        # +inf never opens, -inf always opens; both are useful extremes.
+        always_closed = self.speech.noise_gate(
+            open_threshold=float("inf"), close_threshold=-float("inf"),
+            attenuation=float("inf"))
+        self.assertEqual(always_closed.rms, 0)
+
+        always_open = self.speech.noise_gate(
+            open_threshold=-float("inf"), close_threshold=-float("inf"))
+        self.assertEqual(always_open._data, self.speech._data)
+
+    def test_zero_attenuation_is_a_no_op(self):
+        self.assertEqual(self.speech.noise_gate(attenuation=0)._data,
+                         self.speech._data)
+
+    def test_full_attenuation_mutes(self):
+        gated = self.speech.noise_gate(
+            open_threshold=-30, close_threshold=-35, hold=0, release=10,
+            attenuation=float("inf"))
+        self.assertEqual(gated[150:250].rms, 0)
+
+    def test_does_not_clip(self):
+        for sample_width in (1, 2, 4):
+            seg = self.speech.set_sample_width(sample_width)
+            gated = seg.noise_gate(open_threshold=-30)
+            self.assertLessEqual(gated.max, seg.max)
+
+    def test_no_block_boundary_jumps(self):
+        # The largest sample-to-sample step in the output must not exceed the
+        # largest step already present in the input (a smooth sine + noise).
+        seg = (self.tone + self.noise) * 5
+        gated = seg.noise_gate(
+            open_threshold=-30, close_threshold=-35, attack=10, hold=10,
+            release=10, attenuation=40)
+
+        def max_step(audio):
+            samples = audio.get_array_of_samples()
+            return max(abs(samples[i] - samples[i - 1])
+                       for i in range(1, len(samples)))
+
+        self.assertLessEqual(max_step(gated), max_step(seg))
+
+    def test_compress_dynamic_range_is_unchanged(self):
+        # Guard the neighbouring effect: it should still reduce peaks and
+        # loudness exactly as before the gate was added.
+        compressed = self.speech.compress_dynamic_range()
+        self.assertTrue(compressed.max <= self.speech.max)
+        self.assertTrue(compressed.rms <= self.speech.rms)
+
+
 class GeneratorTests(unittest.TestCase):
 
     def test_with_smoke(self):
