@@ -1,4 +1,6 @@
 from functools import partial
+import array
+import math
 import os
 import sys
 import unittest
@@ -20,6 +22,7 @@ from pydub.utils import (
     get_encoder_name,
     get_supported_decoders,
     get_supported_encoders,
+    get_min_max_value,
 )
 from pydub.exceptions import (
     InvalidTag,
@@ -1329,6 +1332,257 @@ class FilterTests(unittest.TestCase):
         s = Sine(100).to_audio_segment()
         less_treble = s.low_pass_filter(800)
         self.assertAlmostEqual(less_treble.dBFS, s.dBFS, places=0)
+
+
+class ParametricEQTests(unittest.TestCase):
+    """Tests for the multi-band AudioSegment.parametric_eq() effect."""
+
+    # 4 seconds @ 44.1 kHz gives FFT bins of 0.25 Hz, so the tone at each
+    # probe frequency is measured without leaking from its neighbours.
+    FRAME_RATE = 44100
+    DURATION_MS = 4000
+    PROBE_FREQUENCIES = (100, 250, 600, 1000, 2200, 4000, 8000)
+
+    def _probe(self, frequency):
+        return Sine(frequency, sample_rate=self.FRAME_RATE).to_audio_segment(
+            self.DURATION_MS, volume=-12)
+
+    def _multi_tone(self):
+        """Sum of sines at well separated frequencies, as one mono segment."""
+        total = None
+        for frequency in self.PROBE_FREQUENCIES:
+            tone = self._probe(frequency)
+            total = tone if total is None else total.overlay(tone)
+        return total
+
+    @staticmethod
+    def _samples(seg):
+        # Integer samples; Python's array slicing keeps channels intact.
+        return array.array("d", seg.get_array_of_samples())
+
+    def _tone_gain_db(self, before, after, frequency):
+        """Measure the steady-state gain at one frequency with a Goertzel
+        filter (avoids an FFT dependency and windowing effects)."""
+        def magnitude(seg):
+            samples = self._samples(seg.split_to_mono()[0])
+            # skip the first 50 ms (filter transient) for both measurements
+            skip = int(seg.frame_rate * 0.05)
+            samples = samples[skip:]
+            coefficient = 2.0 * math.cos(
+                2.0 * math.pi * frequency / seg.frame_rate)
+            s1 = s2 = 0.0
+            for sample in samples:
+                s0 = sample + coefficient * s1 - s2
+                s2 = s1
+                s1 = s0
+            power = s1 * s1 + s2 * s2 - coefficient * s1 * s2
+            return math.sqrt(max(power, 0.0)) / len(samples)
+
+        return ratio_to_db(magnitude(after) / magnitude(before))
+
+    # ---------------------------------------------------------- response
+
+    def test_gain_at_center_frequencies_is_measurable(self):
+        source = self._multi_tone()
+        eq = source.parametric_eq([
+            (250.0, 3.0, -9.0),
+            (4000.0, 3.0, 6.0),
+        ])
+        for frequency, expected in ((250, -9.0), (4000, 6.0)):
+            measured = self._tone_gain_db(source, eq, frequency)
+            self.assertLess(abs(measured - expected), 0.5,
+                            "at %s Hz: measured %.2f dB, asked %.1f dB"
+                            % (frequency, measured, expected))
+
+    def test_bands_leave_far_away_frequencies_alone(self):
+        source = self._multi_tone()
+        eq = source.parametric_eq([(250.0, 3.0, -9.0), (4000.0, 3.0, 6.0)])
+        for frequency in (100, 8000):
+            measured = self._tone_gain_db(source, eq, frequency)
+            self.assertLess(abs(measured), 1.0,
+                            "%s Hz moved by %.2f dB" % (frequency, measured))
+
+    def test_boost_and_cut_go_the_right_way(self):
+        source = self._probe(1000)
+        boosted = source.parametric_eq([(1000, 1.0, 6.0)])
+        cut = source.parametric_eq([(1000, 1.0, -6.0)])
+        self.assertGreater(boosted.dBFS, source.dBFS)
+        self.assertLess(cut.dBFS, source.dBFS)
+
+    def test_narrow_band_does_not_affect_neighbours(self):
+        # A high-Q band at 1 kHz must not meaningfully move 600 Hz or 2.2 kHz
+        source = self._multi_tone()
+        eq = source.parametric_eq([(1000.0, 8.0, -12.0)])
+        self.assertGreater(
+            abs(self._tone_gain_db(source, eq, 1000)), 8.0)
+        for frequency in (600, 2200):
+            self.assertLess(abs(self._tone_gain_db(source, eq, frequency)),
+                            1.0)
+
+    def test_zero_gain_is_an_exact_identity(self):
+        source = self._multi_tone()
+        for spec in ([], [(250, 1.0, 0.0)], [{"frequency": 4000.0,
+                                              "q": 2.0, "gain_db": -0.0}]):
+            self.assertEqual(source.parametric_eq(spec)._data, source._data)
+
+    def test_bands_apply_in_order(self):
+        source = self._multi_tone()
+        forward = source.parametric_eq([(250, 1.0, 6.0), (4000, 1.0, -6.0)])
+        backward = source.parametric_eq([(4000, 1.0, -6.0), (250, 1.0, 6.0)])
+        # peaking biquads commute mathematically; with no clipping entering
+        # the cascade the two orderings must match to within quantization
+        a = self._samples(forward)
+        b = self._samples(backward)
+        self.assertLessEqual(
+            max(abs(x - y) for x, y in zip(a, b)), 1.0)
+
+    # ----------------------------------------------------- segment shapes
+
+    def test_stereo_channels_are_filtered_independently(self):
+        # distinct content per channel, so any bleed changes the result
+        left = self._probe(250)
+        right = self._probe(4000)
+        stereo = AudioSegment.from_mono_audiosegments(left, right)
+        eq = stereo.parametric_eq([(250.0, 3.0, -9.0), (4000.0, 3.0, 6.0)])
+
+        eq_left, eq_right = eq.split_to_mono()
+        mono_left = left.parametric_eq([(250.0, 3.0, -9.0),
+                                        (4000.0, 3.0, 6.0)])
+        mono_right = right.parametric_eq([(250.0, 3.0, -9.0),
+                                          (4000.0, 3.0, 6.0)])
+        self.assertEqual(eq_left._data, mono_left._data)
+        self.assertEqual(eq_right._data, mono_right._data)
+
+        # and interleaving is preserved (even frames = left, odd = right)
+        raw = array.array(eq.array_type, eq.raw_data)
+        self.assertEqual(raw[0::2].tobytes(), eq_left.raw_data)
+        self.assertEqual(raw[1::2].tobytes(), eq_right.raw_data)
+
+    def test_attributes_and_length_are_preserved(self):
+        for channels in (1, 2):
+            source = self._multi_tone()
+            if channels == 2:
+                source = AudioSegment.from_mono_audiosegments(source, source)
+            eq = source.parametric_eq([(1000.0, 2.0, 3.0)])
+            self.assertEqual(eq.channels, source.channels)
+            self.assertEqual(eq.sample_width, source.sample_width)
+            self.assertEqual(eq.frame_rate, source.frame_rate)
+            self.assertEqual(eq.frame_width, source.frame_width)
+            self.assertEqual(eq.frame_count(), source.frame_count())
+            self.assertEqual(len(eq.raw_data), len(source.raw_data))
+
+    def test_all_sample_widths_process_and_clip_deterministically(self):
+        quiet = self._probe(1000).apply_gain(-6)
+        for sample_width in (1, 2, 4):
+            source = quiet.set_sample_width(sample_width)
+            eq = source.parametric_eq([(1000.0, 1.0, 6.0)])
+            self.assertEqual(eq.sample_width, sample_width)
+            self.assertEqual(eq.frame_count(), source.frame_count())
+            values = eq.get_array_of_samples()
+            minval, maxval = get_min_max_value(sample_width * 8)
+            self.assertGreaterEqual(min(values), minval)
+            self.assertLessEqual(max(values), maxval)
+
+        # a loud boost must saturate, not wrap: an all-positive input can
+        # never produce negative samples
+        loud = AudioSegment.silent(200, frame_rate=44100).overlay(
+            Sine(1000, sample_rate=44100).to_audio_segment(200))
+        loud = loud.apply_gain(-1)
+        for sample_width in (1, 2, 4):
+            source = loud.set_sample_width(sample_width)
+            eq = source.parametric_eq([(1000.0, 1.0, 12.0)])
+            values = eq.get_array_of_samples()
+            minval, maxval = get_min_max_value(sample_width * 8)
+            self.assertEqual(max(values), maxval)
+            self.assertGreaterEqual(min(values), minval)
+
+    def test_empty_segment_returns_empty_segment(self):
+        empty = AudioSegment.empty()
+        out = empty.parametric_eq([(250.0, 1.0, 3.0)])
+        self.assertEqual(out.frame_count(), 0)
+        self.assertEqual(out.raw_data, b"")
+
+    def test_segments_shorter_than_filter_state(self):
+        source = self._probe(1000)[:1]  # ~44 samples
+        for frame_count in range(1, 4):
+            tiny = source[:frame_count]
+            out = tiny.parametric_eq([(1000.0, 1.0, 6.0)])
+            self.assertEqual(out.frame_count(), tiny.frame_count())
+            self.assertEqual(len(out.raw_data), len(tiny.raw_data))
+
+    def test_export_round_trip(self):
+        stereo = AudioSegment.from_mono_audiosegments(
+            self._probe(250), self._probe(4000))
+        eq = stereo.parametric_eq([(250.0, 2.0, -6.0),
+                                   (4000.0, 2.0, 4.0)])
+        with NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            path = tmp_file.name
+        try:
+            eq.export(path, format="wav")
+            reloaded = AudioSegment.from_wav(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(reloaded.raw_data, eq.raw_data)
+        self.assertEqual(
+            (reloaded.channels, reloaded.sample_width, reloaded.frame_rate,
+             reloaded.frame_count()),
+            (eq.channels, eq.sample_width, eq.frame_rate, eq.frame_count()))
+
+    # -------------------------------------------------------- validation
+
+    def test_invalid_bands_raise_value_error(self):
+        source = self._probe(1000)
+        nyquist = source.frame_rate / 2.0
+        bad_specs = [
+            [(nyquist, 1.0, 3.0)],           # at Nyquist
+            [(nyquist + 1, 1.0, 3.0)],       # above Nyquist
+            [(0, 1.0, 3.0)],                 # zero frequency
+            [(-250, 1.0, 3.0)],              # negative frequency
+            [(float("nan"), 1.0, 3.0)],      # non-finite frequency
+            [(250, 0, 3.0)],                 # zero Q
+            [(250, -1.5, 3.0)],              # negative Q
+            [(250, float("inf"), 3.0)],      # non-finite Q
+            [(250, 1.0, float("nan"))],      # non-finite gain
+            [(250, 1.0, float("inf"))],      # non-finite gain
+            [(250, 1.0)],                    # truncated tuple
+            [{"freq": 250, "q": 1.0}],       # missing gain key
+            [{"freq": 250, "q": 1.0, "gain_db": 1.0, "extra": 0}],
+            [42],                            # not a band at all
+            None,
+        ]
+        for spec in bad_specs:
+            self.assertRaises(ValueError, source.parametric_eq, spec)
+
+        # validation happens before processing: a bad later band is caught
+        self.assertRaises(ValueError, source.parametric_eq,
+                          [(250, 1.0, 3.0), (nyquist + 1, 1.0, 3.0)])
+
+    def test_dict_band_aliases(self):
+        source = self._probe(1000)
+        expected = source.parametric_eq([(1000.0, 2.0, -4.0)])
+        for band in ({"freq": 1000, "q": 2.0, "gain_db": -4.0},
+                     {"frequency": 1000, "Q": 2.0, "gain": -4.0},
+                     {"  frequency ": 1000, "quality": 2.0, "gain_db": -4.0}):
+            self.assertEqual(source.parametric_eq([band])._data,
+                             expected._data)
+
+    # -------------------------------------------------- existing filters
+
+    def test_existing_low_and_high_pass_filters_unchanged(self):
+        seg = self.seg1 = AudioSegment.from_wav(
+            os.path.join(data_dir, 'test1.wav'))
+        self.assertEqual(seg.channels, 2)
+        self.assertLess(seg.high_pass_filter(800).dBFS, seg.dBFS)
+        self.assertLess(seg.low_pass_filter(800).dBFS, seg.dBFS)
+
+        tone = Sine(800, sample_rate=32000).to_audio_segment(500)
+        self.assertAlmostEqual(
+            tone.high_pass_filter(100).dBFS, tone.dBFS, places=0)
+        self.assertAlmostEqual(
+            Sine(100, sample_rate=32000).to_audio_segment(
+                500).low_pass_filter(800).dBFS,
+            Sine(100, sample_rate=32000).to_audio_segment(500).dBFS,
+            places=0)
 
 
 class PartialAudioSegmentLoadTests(unittest.TestCase):

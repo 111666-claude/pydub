@@ -608,6 +608,33 @@ Removes DC offset from channel(s). This is done by using `audioop.bias()`, so wa
 
 Collection of DSP effects that are implemented by `AudioSegment` objects.
 
+### AudioSegment(…).parametric_eq()
+
+Apply a multi-band peaking (bell) equalizer. Each band is given as a `(frequency, q, gain_db)` tuple, or as a dict with the keys `freq`/`frequency`, `q`/`quality` and `gain_db`/`gain`. Bands are applied in the order given; each one boosts or cuts around its center frequency by `gain_db`, with `q` controlling how wide the bell is.
+
+- `frequency` | center frequency in Hz. Must be greater than 0 and below the Nyquist frequency (`frame_rate / 2`); otherwise `ValueError` is raised.
+- `q` | must be greater than 0.
+- `gain_db` | gain at the center frequency. `0` is an exact identity.
+
+`frame_rate`, `sample_width`, `channels` and the number of frames are preserved, and every channel is filtered independently. The filter starts from zero state, so segments shorter than the filter's history are processed normally. Results are computed in double precision and clipped deterministically to the sample width's range on overflow (they never wrap around). Empty segments return an empty segment.
+
+```python
+from pydub import AudioSegment
+sound = AudioSegment.from_file("voiceover.wav")
+
+# tame a boomy 250 Hz region and soften a harsh 4 kHz peak
+eq = sound.parametric_eq([
+    (250, 3.0, -9.0),
+    (4000, 3.0, -6.0),
+])
+
+# the dict form is equivalent
+eq = sound.parametric_eq([
+    {"frequency": 250, "q": 3.0, "gain_db": -9.0},
+    {"freq": 4000, "q": 3.0, "gain": -6.0},
+])
+```
+
 ### AudioSegment(…).invert_phase()
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
