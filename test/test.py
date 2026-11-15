@@ -1086,7 +1086,7 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
@@ -1109,7 +1109,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(
@@ -1394,6 +1394,219 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class TimeStretchTests(unittest.TestCase):
+    """Tests for the pitch-preserving AudioSegment.time_stretch() effect."""
+
+    @staticmethod
+    def _dominant_frequency(seg):
+        """Estimate the dominant frequency of a (near-sinusoidal) segment
+        by counting positive-going zero crossings."""
+        mono = seg if seg.channels == 1 else seg.split_to_mono()[0]
+        samples = list(mono.get_array_of_samples())
+        crossings = sum(1 for i in range(1, len(samples))
+                        if samples[i - 1] <= 0 < samples[i])
+        return crossings * mono.frame_rate / len(samples)
+
+    @staticmethod
+    def _expected_ms(seg, playback_speed):
+        # len(seg) is already floor(ms); the output spans len(seg)/speed
+        return int(len(seg) / playback_speed)
+
+    def setUp(self):
+        # a 2 second, 1 kHz pure tone at a rate that divides it cleanly
+        self.tone = Sine(1000, sample_rate=32000).to_audio_segment(2000)
+
+    def assertWithinOneMs(self, value, expected, speed):
+        self.assertTrue(abs(value - expected) <= 1,
+                        "at %sx: got %sms, expected %sms" %
+                        (speed, value, expected))
+
+    def test_speed_one_returns_equivalent_segment(self):
+        out = self.tone.time_stretch(1.0)
+        self.assertEqual(len(out), len(self.tone))
+        self.assertEqual(out._data, self.tone._data)
+        self.assertEqual(out.frame_rate, self.tone.frame_rate)
+        self.assertEqual(out.channels, self.tone.channels)
+        self.assertEqual(out.sample_width, self.tone.sample_width)
+
+    def test_duration_follows_speed_for_speedup_and_slowdown(self):
+        for playback_speed in (0.25, 0.5, 0.75, 1.5, 2.0, 3.0, 4.0):
+            out = self.tone.time_stretch(playback_speed)
+            expected_ms = self._expected_ms(self.tone, playback_speed)
+            # exact expected length, with a 1ms allowance for frame rounding
+            self.assertWithinOneMs(len(out), expected_ms, playback_speed)
+
+    def test_pitch_is_preserved(self):
+        for playback_speed in (0.25, 0.5, 1.5, 2.0, 4.0):
+            out = self.tone.time_stretch(playback_speed)
+            frequency = self._dominant_frequency(out)
+            # the dominant frequency must stay at 1 kHz regardless of speed
+            self.assertLess(abs(frequency - 1000.0) / 1000.0, 0.02,
+                            "at %sx: estimated %s Hz" %
+                            (playback_speed, frequency))
+
+    def test_preserves_metadata_across_formats(self):
+        for channels in (1, 2):
+            for sample_width in (1, 2, 4):
+                for frame_rate in (8000, 44100):
+                    seg = Sine(440, sample_rate=frame_rate).to_audio_segment(
+                        700).set_sample_width(sample_width)
+                    if channels == 2:
+                        seg = seg.set_channels(2)
+                    for playback_speed in (0.5, 2.0):
+                        out = seg.time_stretch(playback_speed)
+                        self.assertEqual(out.channels, channels)
+                        self.assertEqual(out.sample_width, sample_width)
+                        self.assertEqual(out.frame_rate, frame_rate)
+                        self.assertEqual(
+                            out.frame_width, sample_width * channels)
+                        # data must be a whole number of frames
+                        self.assertEqual(
+                            len(out._data) % out.frame_width, 0)
+                        self.assertEqual(
+                            len(out),
+                            self._expected_ms(seg, playback_speed))
+
+    def test_silence_does_not_become_noise(self):
+        for sample_width in (1, 2, 4):
+            silence = AudioSegment.silent(
+                1000, frame_rate=22050).set_sample_width(sample_width)
+            for playback_speed in (0.25, 0.5, 2.0, 4.0):
+                out = silence.time_stretch(playback_speed)
+                self.assertEqual(out.rms, 0)
+                self.assertEqual(
+                    len(out),
+                    self._expected_ms(silence, playback_speed))
+
+    def test_short_segments_do_not_raise(self):
+        # segments shorter than the filter analysis window must still work
+        for duration_ms in (1, 5, 10, 25, 50):
+            seg = Sine(880).to_audio_segment(duration_ms)
+            for playback_speed in (0.25, 4.0):
+                out = seg.time_stretch(playback_speed)
+                self.assertEqual(out.frame_rate, seg.frame_rate)
+                self.assertEqual(out.channels, seg.channels)
+                self.assertEqual(out.sample_width, seg.sample_width)
+
+    def test_invalid_speeds_raise_recognizable_errors(self):
+        from pydub.exceptions import InvalidSpeed
+        for bad_speed in (0, -1.0, 0.24, 4.01, 100):
+            self.assertRaises(InvalidSpeed,
+                              self.tone.time_stretch, bad_speed)
+        # non-finite numbers are invalid speeds rather than type errors
+        for bad_speed in (float("nan"), float("inf")):
+            self.assertRaises(InvalidSpeed,
+                              self.tone.time_stretch, bad_speed)
+
+    def test_non_numeric_speeds_raise_type_error(self):
+        for bad_speed in ("fast", None, True, False):
+            self.assertRaises(TypeError, self.tone.time_stretch, bad_speed)
+    def test_empty_segment_raises_recognizable_error(self):
+        from pydub.exceptions import CouldntProcessError
+        self.assertRaises(CouldntProcessError,
+                          AudioSegment.empty().time_stretch, 2.0)
+
+    def test_missing_converter_raises_recognizable_error(self):
+        from pydub.exceptions import MissingConverterError
+        original_converter = AudioSegment.converter
+        AudioSegment.converter = "definitely-not-a-real-converter-xyz"
+        try:
+            self.assertRaises(MissingConverterError,
+                              self.tone.time_stretch, 2.0)
+        finally:
+            AudioSegment.converter = original_converter
+
+    def test_no_supported_filter_raises_recognizable_error(self):
+        from pydub import effects
+        from pydub.utils import get_available_filters
+        original = effects.get_available_filters
+        effects.get_available_filters = lambda: set()
+        try:
+            self.assertRaises(effects.CouldntProcessError,
+                              self.tone.time_stretch, 2.0)
+        finally:
+            effects.get_available_filters = original
+        # sanity check: the real environment does offer a usable filter
+        self.assertTrue(
+            {"rubberband", "atempo"} & get_available_filters())
+
+    def test_atempo_fallback_chain(self):
+        # when rubberband is unavailable the implementation decomposes the
+        # speed into atempo factors, each within [0.5, 2.0]
+        from pydub.effects import _atempo_filter_chain
+        self.assertEqual(
+            _atempo_filter_chain(0.25), "atempo=0.5,atempo=0.5")
+        self.assertEqual(
+            _atempo_filter_chain(4.0), "atempo=2,atempo=2")
+        self.assertEqual(_atempo_filter_chain(0.6), "atempo=0.6")
+        self.assertEqual(_atempo_filter_chain(1.7), "atempo=1.7")
+
+    def test_atempo_fallback_processing_path(self):
+        from pydub import effects
+        original = effects.get_available_filters
+        effects.get_available_filters = lambda: {"atempo"}
+        try:
+            for playback_speed in (0.25, 0.5, 1.333, 2.0, 4.0):
+                out = self.tone.time_stretch(playback_speed)
+                self.assertEqual(
+                    len(out),
+                    self._expected_ms(self.tone, playback_speed))
+                frequency = self._dominant_frequency(out)
+                self.assertLess(
+                    abs(frequency - 1000.0) / 1000.0, 0.02)
+                self.assertEqual(out.frame_rate, self.tone.frame_rate)
+        finally:
+            effects.get_available_filters = original
+
+    def test_no_temp_files_are_left_behind(self):
+        tmp_dir = tempfile.gettempdir()
+        before = set(os.listdir(tmp_dir))
+        for playback_speed in (0.25, 0.5, 2.0, 4.0):
+            Sine(440).to_audio_segment(400).time_stretch(playback_speed)
+        after = set(os.listdir(tmp_dir))
+        new_temp_files = [
+            name for name in (after - before) if name.startswith("tmp")]
+        self.assertEqual(new_temp_files, [])
+
+    def test_output_can_be_concatenated_exported_and_reloaded(self):
+        stretched = self.tone.time_stretch(2.0)
+        other = Sine(500, sample_rate=32000).to_audio_segment(500)
+        combined = stretched + other
+        self.assertEqual(len(combined), len(stretched) + len(other))
+
+        delete = sys.platform != 'win32'
+        with NamedTemporaryFile('w+b', suffix='.wav',
+                                delete=delete) as tmp_wav:
+            combined.export(tmp_wav, format='wav')
+            if sys.platform == 'win32':
+                tmp_wav.close()
+            reloaded = AudioSegment.from_wav(tmp_wav.name)
+            if sys.platform == 'win32':
+                os.remove(tmp_wav.name)
+
+        self.assertEqual(len(reloaded), len(combined))
+        self.assertEqual(reloaded.channels, combined.channels)
+        self.assertEqual(reloaded.frame_rate, combined.frame_rate)
+        self.assertEqual(reloaded.sample_width, combined.sample_width)
+
+    def test_works_on_loaded_real_audio(self):
+        path = os.path.join(data_dir, 'test1.wav')
+        seg = AudioSegment.from_wav(path)
+        for playback_speed in (0.5, 1.5, 3.0):
+            out = seg.time_stretch(playback_speed)
+            self.assertEqual(out.channels, seg.channels)
+            self.assertEqual(out.sample_width, seg.sample_width)
+            self.assertEqual(out.frame_rate, seg.frame_rate)
+            self.assertLess(
+                abs(len(out) - len(seg) / playback_speed), 2.0)
+
+    def test_speedup_behavior_is_unchanged(self):
+        seg = Sine(300).to_audio_segment(10000)
+        speedup_seg = seg.speedup(2.0)
+        self.assertTrue(
+            abs(len(seg) / 2 - len(speedup_seg)) / (len(seg) / 2) < 0.02)
 
 
 if __name__ == "__main__":

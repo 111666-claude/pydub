@@ -612,6 +612,27 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).time_stretch(playback_speed)
+
+Pitch-preserving time stretch. Changes the playback speed of the audio without changing its pitch, unlike `AudioSegment(…).set_frame_rate()` (which shifts pitch) or `AudioSegment(…).speedup()` (which approximates acceleration by discarding chunks). Both acceleration and slowdown are supported.
+
+Requires ffmpeg/avconv. The `rubberband` filter is used when the installed build provides it, otherwise an `atempo` filter chain is used. Audio is passed through pipes so no temporary files are created.
+
+```python
+from pydub.generators import Sine
+
+seg = Sine(440).to_audio_segment(duration=2000)  # 2 seconds
+
+faster = seg.time_stretch(2.0)   # ~1 second, still 440 Hz
+slower = seg.time_stretch(0.5)   # ~4 seconds, still 440 Hz
+same   = seg.time_stretch(1.0)   # copy of the original
+```
+
+**Supported keyword arguments**:
+
+- `playback_speed` | example: `1.5` | default: `1.0`
+  Playback speed as a finite number between `0.25` and `4.0`. Values above `1.0` speed the audio up, values below `1.0` slow it down. The output duration is `input_duration / playback_speed`. The frame rate, channel count and sample width are preserved. Raises `pydub.exceptions.InvalidSpeed` for out-of-range or non-finite values, `TypeError` for non-numeric values (including booleans), `pydub.exceptions.MissingConverterError` when ffmpeg/avconv is unavailable, and `pydub.exceptions.CouldntProcessError` for empty segments or processing failures.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

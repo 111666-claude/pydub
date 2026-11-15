@@ -5,12 +5,28 @@ except ImportError:
     from builtins import max as builtin_max
     from builtins import min as builtin_min
 import math
+import sys
 import struct
 try:
     from fractions import gcd
 except ImportError:  # Python 3.9+
     from math import gcd
 from ctypes import create_string_buffer
+
+try:
+    # Python 2 only
+    buffer  # noqa: F821
+except NameError:
+    # in Python 3 bytes already supports the memoryview-style slicing the
+    # stdlib audioop code relied on buffer() for
+    buffer = lambda obj: obj
+
+if sys.version_info >= (3, 0):
+    def _next(iterator):
+        return next(iterator)
+else:
+    def _next(iterator):
+        return iterator.next()
 
 
 class error(Exception):
@@ -29,7 +45,7 @@ def _check_params(length, size):
 
 
 def _sample_count(cp, size):
-    return len(cp) / size
+    return len(cp) // size
 
 
 def _get_samples(cp, size, signed=True):
@@ -91,6 +107,8 @@ def _get_clipfn(size, signed=True):
 
 
 def _overflow(val, size, signed=True):
+    # audioop always operates on integer samples
+    val = int(val)
     minval = _get_minval(size, signed)
     maxval = _get_maxval(size, signed)
     if minval <= val <= maxval:
@@ -106,7 +124,7 @@ def _overflow(val, size, signed=True):
 
 def getsample(cp, size, i):
     _check_params(len(cp), size)
-    if not (0 <= i < len(cp) / size):
+    if not (0 <= i < len(cp) // size):
         raise error("Index out of range")
     return _get_sample(cp, size, i)
 
@@ -345,16 +363,16 @@ def tomono(cp, size, fac1, fac2):
 
     sample_count = _sample_count(cp, size)
 
-    result = create_string_buffer(len(cp) / 2)
+    result = create_string_buffer(len(cp) // 2)
 
     for i in range(0, sample_count, 2):
         l_sample = getsample(cp, size, i)
         r_sample = getsample(cp, size, i + 1)
 
         sample = (l_sample * fac1) + (r_sample * fac2)
-        sample = clip(sample)
+        sample = int(clip(sample))
 
-        _put_sample(result, size, i / 2, sample)
+        _put_sample(result, size, i // 2, sample)
 
     return result.raw
 
@@ -370,8 +388,8 @@ def tostereo(cp, size, fac1, fac2):
     for i in range(sample_count):
         sample = _get_sample(cp, size, i)
 
-        l_sample = clip(sample * fac1)
-        r_sample = clip(sample * fac2)
+        l_sample = int(clip(sample * fac1))
+        r_sample = int(clip(sample * fac2))
 
         _put_sample(result, size, i * 2, l_sample)
         _put_sample(result, size, i * 2 + 1, r_sample)
@@ -430,16 +448,16 @@ def lin2lin(cp, size, size2):
     if size == size2:
         return cp
 
-    new_len = (len(cp) / size) * size2
+    new_len = (len(cp) // size) * size2
 
     result = create_string_buffer(new_len)
 
     for i in range(_sample_count(cp, size)):
         sample = _get_sample(cp, size, i)
         if size < size2:
-            sample = sample << (4 * size2 / size)
+            sample = sample << (4 * size2 // size)
         elif size > size2:
-            sample = sample >> (4 * size / size2)
+            sample = sample >> (4 * size // size2)
 
         sample = _overflow(sample, size2)
 
@@ -454,9 +472,9 @@ def ratecv(cp, size, nchannels, inrate, outrate, state, weightA=1, weightB=0):
         raise error("# of channels should be >= 1")
 
     bytes_per_frame = size * nchannels
-    frame_count = len(cp) / bytes_per_frame
+    frame_count = len(cp) // bytes_per_frame
 
-    if bytes_per_frame / nchannels != size:
+    if bytes_per_frame // nchannels != size:
         raise OverflowError("width * nchannels too big for a C int")
 
     if weightA < 1 or weightB < 0:
@@ -469,8 +487,8 @@ def ratecv(cp, size, nchannels, inrate, outrate, state, weightA=1, weightB=0):
         raise error("sampling rate not > 0")
 
     d = gcd(inrate, outrate)
-    inrate /= d
-    outrate /= d
+    inrate //= d
+    outrate //= d
 
     prev_i = [0] * nchannels
     cur_i = [0] * nchannels
@@ -486,8 +504,10 @@ def ratecv(cp, size, nchannels, inrate, outrate, state, weightA=1, weightB=0):
         prev_i, cur_i = zip(*samps)
         prev_i, cur_i = list(prev_i), list(cur_i)
 
-    q = frame_count / inrate
-    ceiling = (q + 1) * outrate
+    # CPython allocates ceil(frame_count / inrate) * outrate frames as a
+    # safe upper bound; only the prefix actually written is returned
+    q = 1 + (frame_count - 1) // inrate
+    ceiling = q * outrate
     nbytes = ceiling * bytes_per_frame
 
     result = create_string_buffer(nbytes)
@@ -498,17 +518,14 @@ def ratecv(cp, size, nchannels, inrate, outrate, state, weightA=1, weightB=0):
         while d < 0:
             if frame_count == 0:
                 samps = zip(prev_i, cur_i)
-                retval = result.raw
-
-                # slice off extra bytes
-                trim_index = (out_i * bytes_per_frame) - len(retval)
-                retval = buffer(retval)[:trim_index]
-
+                # return only the bytes that were actually produced,
+                # matching the pointer arithmetic of the C implementation
+                retval = result.raw[:out_i * bytes_per_frame]
                 return (retval, (d, tuple(samps)))
 
             for chan in range(nchannels):
                 prev_i[chan] = cur_i[chan]
-                cur_i[chan] = samples.next()
+                cur_i[chan] = _next(samples)
 
                 cur_i[chan] = (
                     (weightA * cur_i[chan] + weightB * prev_i[chan])
@@ -524,10 +541,12 @@ def ratecv(cp, size, nchannels, inrate, outrate, state, weightA=1, weightB=0):
                     (prev_i[chan] * d + cur_i[chan] * (outrate - d))
                     / outrate
                 )
-                _put_sample(result, size, out_i, _overflow(cur_o, size))
-                out_i += 1
+                # out_i is a frame index; _put_sample expects an
+                # interleaved per-channel sample index
+                _put_sample(result, size, out_i * nchannels + chan,
+                            _overflow(cur_o, size))
+            out_i += 1
             d -= inrate
-
 
 def lin2ulaw(cp, size):
     raise NotImplementedError()

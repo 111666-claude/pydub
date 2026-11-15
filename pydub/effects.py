@@ -1,19 +1,52 @@
 import sys
 import math
 import array
+import wave
+import subprocess
+from io import BytesIO
 from .utils import (
     db_to_float,
     ratio_to_db,
     register_pydub_effect,
     make_chunks,
     audioop,
+    which,
+    get_available_filters,
     get_min_max_value
 )
+from .logging_utils import log_conversion, log_subprocess_output
+from .audio_segment import AudioSegment
 from .silence import split_on_silence
-from .exceptions import TooManyMissingFrames, InvalidDuration
+from .exceptions import (
+    TooManyMissingFrames,
+    InvalidDuration,
+    InvalidSpeed,
+    MissingConverterError,
+    CouldntProcessError,
+)
 
 if sys.version_info >= (3, 0):
     xrange = range
+
+# pitch-preserving time stretching is supported within this speed range
+MIN_PLAYBACK_SPEED = 0.25
+MAX_PLAYBACK_SPEED = 4.0
+
+# the rubberband/atempo filters buffer whole analysis windows and can drop
+# the tail of inputs (observed losses of ~15ms with rubberband and ~80ms
+# with a chained atempo filter, measured on the output timeline). A silence
+# is appended before processing and trimmed back off afterwards; this is
+# the amount of spare output (in milliseconds on the output timeline) the
+# padding guarantees.
+_OUTPUT_TAIL_HEADROOM_MS = 500
+
+# PCM codecs matching the sample widths pydub uses (8-bit audio is unsigned
+# in WAV containers)
+_PCM_CODECS_BY_SAMPLE_WIDTH = {
+    1: "pcm_u8",
+    2: "pcm_s16le",
+    4: "pcm_s32le",
+}
 
 
 @register_pydub_effect
@@ -92,7 +125,190 @@ def speedup(seg, playback_speed=1.5, chunk_size=150, crossfade=25):
 
     out += last_chunk
     return out
-    
+
+
+def _atempo_filter_chain(playback_speed):
+    """
+    Build an ffmpeg ``atempo`` filter chain for playback_speed.
+
+    A single atempo filter only accepts values in [0.5, 2.0], so speeds
+    outside that interval are decomposed into factors that each fall inside
+    it (the supported speed range 0.25 - 4.0 needs at most two filters).
+    The factors are chosen so their product is exactly playback_speed.
+    """
+    factors = []
+    remaining = float(playback_speed)
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    factors.append(remaining)
+    return ",".join("atempo={0:.10g}".format(factor) for factor in factors)
+
+
+@register_pydub_effect
+def time_stretch(seg, playback_speed=1.0):
+    """
+    Pitch-preserving time stretch: change the playback speed without
+    changing the pitch of the audio (unlike simply changing the frame
+    rate, which shifts pitch, or ``speedup()``, which approximates
+    acceleration by discarding chunks).
+
+    playback_speed - positive float in the range 0.25 - 4.0:
+        values above 1.0 speed the audio up, values below 1.0 slow it
+        down. 1.0 returns a copy of the segment unchanged.
+
+    The output duration is ``input_duration / playback_speed`` while the
+    frame rate, channel count and sample width are preserved.
+
+    Requires ffmpeg (the ``rubberband`` filter is used when available,
+    otherwise an ``atempo`` filter chain is used). Audio is processed
+    entirely through pipes, so no temporary files are created.
+    """
+    # bool is a subclass of int but does not make sense as a speed
+    if isinstance(playback_speed, bool) or not isinstance(
+            playback_speed, (int, float)):
+        raise TypeError(
+            "playback_speed must be a number, got {0}".format(
+                type(playback_speed).__name__))
+
+    playback_speed = float(playback_speed)
+    if not math.isfinite(playback_speed):
+        raise InvalidSpeed(
+            "playback_speed must be a finite number, got {0}".format(
+                playback_speed))
+    if not (MIN_PLAYBACK_SPEED <= playback_speed <= MAX_PLAYBACK_SPEED):
+        raise InvalidSpeed(
+            "playback_speed must be between {0} and {1}, got {2}".format(
+                MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED, playback_speed))
+
+    # 1.0 means no time stretching at all
+    if playback_speed == 1.0:
+        return seg._spawn(seg._data)
+
+    if len(seg) == 0:
+        raise CouldntProcessError(
+            "Cannot time stretch an empty (zero-length) AudioSegment")
+
+    converter = seg.converter
+    if not which(converter):
+        raise MissingConverterError(
+            "Could not find {0!r}; time_stretch() requires ffmpeg or "
+            "avconv to be installed and available on PATH".format(converter))
+
+    pcm_codec = _PCM_CODECS_BY_SAMPLE_WIDTH.get(seg.sample_width)
+    if pcm_codec is None:
+        raise CouldntProcessError(
+            "time_stretch() cannot process audio with a sample width of "
+            "{0} bytes; use set_sample_width() to convert to 1, 2 or 4 "
+            "bytes first".format(seg.sample_width))
+
+    # The time-stretch filters process the signal in fixed-size windows and
+    # may truncate the tail (observed up to ~80ms on the output timeline
+    # with a chained atempo filter). A silence is appended before processing
+    # so the whole signal fits inside the output, then the output is trimmed
+    # to the exact target duration. The headroom is requested on the output
+    # timeline, hence it is multiplied by the speed to get the input-side
+    # padding duration (slowing down compresses the padding on output).
+    padding_ms = int(math.ceil(
+        _OUTPUT_TAIL_HEADROOM_MS * playback_speed))
+    # append() syncs channel count, sample width and frame rate by itself
+    padded = seg + AudioSegment.silent(
+        padding_ms, frame_rate=seg.frame_rate)
+
+    # pipe the segment's raw PCM data into the converter as an uncompressed
+    # WAV stream; everything stays in memory (no temporary files)
+    wav_buffer = BytesIO()
+    wav_data = padded._data
+    if seg.sample_width == 1:
+        # WAV stores 8-bit PCM as unsigned integers
+        wav_data = audioop.bias(wav_data, 1, 128)
+    with wave.open(wav_buffer, 'wb') as wav_file:
+        wav_file.setnchannels(seg.channels)
+        wav_file.setsampwidth(seg.sample_width)
+        wav_file.setframerate(seg.frame_rate)
+        wav_file.writeframes(wav_data)
+
+    available_filters = get_available_filters()
+    if "rubberband" in available_filters:
+        # rubberband is the highest quality option and natively covers the
+        # whole supported speed range; pitch defaults to 1.0 (unchanged)
+        audio_filter = "rubberband=tempo={0:.10g}:pitch=1.0".format(
+            playback_speed)
+    elif "atempo" in available_filters:
+        audio_filter = _atempo_filter_chain(playback_speed)
+    else:
+        raise CouldntProcessError(
+            "The installed {0} build provides neither the 'rubberband' nor "
+            "the 'atempo' audio filter, which time_stretch() requires".format(
+                converter))
+
+    conversion_command = [
+        converter,
+        "-y",
+        "-hide_banner",
+        "-f", "wav", "-i", "-",
+        "-vn",
+        "-acodec", pcm_codec,
+        "-filter:a", audio_filter,
+        "-f", "wav", "-",
+    ]
+
+    log_conversion(conversion_command)
+
+    try:
+        process = subprocess.Popen(
+            conversion_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise MissingConverterError(
+            "Could not invoke {0!r}: {1}".format(converter, exc))
+
+    p_out, p_err = process.communicate(input=wav_buffer.getvalue())
+    log_subprocess_output(p_err)
+
+    if process.returncode != 0 or not p_out:
+        raise CouldntProcessError(
+            "Time stretch failed. {0} returned error code {1}\n\n"
+            "Output from {0}:\n\n{2}".format(
+                converter, process.returncode,
+                p_err.decode(errors='ignore')))
+
+    # parse the output WAV and re-apply the segment's own metadata so the
+    # frame rate, channel count and sample width are preserved exactly
+    try:
+        out_seg = seg.__class__(p_out)
+    except Exception as exc:
+        raise CouldntProcessError(
+            "Time stretch produced unreadable output: {0}".format(exc))
+
+    # trim the tail padding back off so the output duration is
+    # input_duration / playback_speed, using the same millisecond rounding
+    # (floor) that len() uses
+    frame_width = seg.frame_width
+    target_ms = int(len(seg) / playback_speed)
+    target_frames = int(target_ms * seg.frame_rate / 1000.0)
+    target_bytes = target_frames * frame_width
+    if len(out_seg._data) < target_bytes:
+        raise CouldntProcessError(
+            "Time stretch produced shorter output than expected "
+            "({0} frames instead of {1})".format(
+                len(out_seg._data) // frame_width, target_frames))
+    out_data = out_seg._data[:target_bytes]
+
+    return seg._spawn(
+        out_data,
+        overrides={
+            'channels': seg.channels,
+            'sample_width': seg.sample_width,
+            'frame_rate': seg.frame_rate,
+            'frame_width': frame_width,
+        })
+
 
 @register_pydub_effect
 def strip_silence(seg, silence_len=1000, silence_thresh=-16, padding=100):

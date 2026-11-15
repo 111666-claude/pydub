@@ -14,7 +14,7 @@ from functools import wraps
 try:
     import audioop
 except ImportError:
-    import pyaudioop as audioop
+    from . import pyaudioop as audioop
 
 if sys.version_info >= (3, 0):
     basestring = str
@@ -421,6 +421,38 @@ def get_supported_decoders():
 
 def get_supported_encoders():
     return get_supported_codecs()[1]
+
+
+@cache_codecs
+def get_available_filters():
+    """
+    Return the set of audio filter names supported by the installed
+    ffmpeg/avconv build (e.g. {"atempo", "rubberband", ...}).
+    Returns an empty set when the converter is missing or fails.
+    """
+    converter = get_encoder_name()
+    if not which(converter):
+        return set()
+
+    command = [converter, "-hide_banner", "-filters"]
+    try:
+        res = Popen(command, stdout=PIPE, stderr=PIPE)
+        output = res.communicate()[0].decode("utf-8")
+    except OSError:
+        return set()
+    if res.returncode != 0:
+        return set()
+
+    filters = set()
+    for line in output.split('\n'):
+        # filter lines look like:
+        #  " .. atempo            A->A       Adjust audio tempo."
+        # the token following the filter name describes the supported
+        # input/output stream types (e.g. A->A, V->V, A->|, ...)
+        match = re.match(r"\s*\S{2}\s+(\w+)\s+\S*->\S*", line)
+        if match:
+            filters.add(match.group(1))
+    return filters
 
 def stereo_to_ms(audio_segment):
 	'''
