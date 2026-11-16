@@ -187,6 +187,116 @@ def compress_dynamic_range(seg, threshold=-20.0, ratio=4.0, attack=5.0, release=
     return seg._spawn(data=b''.join(output))
 
 
+@register_pydub_effect
+def limit(seg, peak_limit=-1.0, lookahead=5.0, release=50.0):
+    """
+    Lookahead peak limiter.
+
+    Attenuates the signal just enough to make sure no sample exceeds
+    ``peak_limit``, smoothly ramping the gain *ahead* of each peak instead of
+    hard-clipping it. Unlike normalize() the overall gain is left untouched
+    except where the signal would otherwise exceed the ceiling, so a signal
+    with only a few overshooting samples does not get scaled down in its
+    entirety.
+
+    Keyword Arguments:
+
+        peak_limit - default: -1.0
+            Ceiling in dBFS (relative to the maximum possible amplitude of
+            the segment). Must be finite and <= 0. A value of 0.0 limits to
+            the full-scale value of the sample width.
+
+        lookahead - default: 5.0
+            Look-ahead time in milliseconds. The gain starts ramping down
+            this far before every peak, so the attenuation is fully applied
+            by the time the peak arrives. Must be finite and >= 0.
+
+        release - default: 50.0
+            Release time in milliseconds. The minimum time the gain takes to
+            recover (from full attenuation back to unity) after the signal
+            falls below the ceiling. Must be finite and >= 0.
+
+    The same gain is applied to every channel of a multichannel segment, so
+    the relative level (stereo balance) of the channels is preserved.
+
+    The output keeps the sample rate, number of channels, sample width and
+    duration of the input. Empty segments are returned unchanged and no
+    sample is ever raised above the ceiling or outside the integer range.
+    """
+    if not math.isfinite(peak_limit) or peak_limit > 0.0:
+        raise ValueError("peak_limit must be a finite number <= 0 (dBFS)")
+    if not math.isfinite(lookahead) or lookahead < 0.0:
+        raise ValueError("lookahead must be a finite number >= 0 (milliseconds)")
+    if not math.isfinite(release) or release < 0.0:
+        raise ValueError("release must be a finite number >= 0 (milliseconds)")
+
+    # nothing to limit
+    if seg.frame_count() == 0:
+        return seg
+
+    channels = seg.channels
+    frame_count = int(seg.frame_count())
+    ceiling = seg.max_possible_amplitude * db_to_float(peak_limit)
+
+    samples = seg.get_array_of_samples()
+    min_val, max_val = get_min_max_value(seg.sample_width * 8)
+
+    # gain (multiplier, 1.0 == unity) required at each frame, based on the
+    # frame's own loudest channel, to keep it at or below the ceiling.
+    required_gain = [1.0] * frame_count
+    for i in xrange(frame_count):
+        offset = i * channels
+        peak = 0
+        for j in xrange(offset, offset + channels):
+            val = samples[j]
+            if val < 0:
+                val = -val
+            if val > peak:
+                peak = val
+        if peak > ceiling:
+            required_gain[i] = ceiling / peak
+
+    # backward pass: spread each required attenuation over the lookahead
+    # window. Walking backward, the gain may rise by at most
+    # 1/lookahead_frames per frame, which - read forward - means the gain
+    # starts ramping down that far before every peak and reaches the needed
+    # attenuation exactly at the peak frame.
+    lookahead_frames = max(1, int(seg.frame_count(ms=lookahead)))
+    envelope = [1.0] * frame_count
+    envelope[-1] = required_gain[-1]
+    for i in xrange(frame_count - 2, -1, -1):
+        ramped_up = envelope[i + 1] + (1.0 / lookahead_frames)
+        if ramped_up < required_gain[i]:
+            envelope[i] = ramped_up
+        else:
+            envelope[i] = required_gain[i]
+
+    # forward pass: limit how fast the gain may recover (release time) and
+    # apply the resulting common gain to every channel.
+    release_inc = 1.0 / max(1, int(seg.frame_count(ms=release)))
+    gain = envelope[0]
+    out = array.array(seg.array_type, samples)
+    for i in xrange(frame_count):
+        target = envelope[i]
+        if target < gain:
+            gain = target
+        else:
+            gain = min(target, gain + release_inc)
+
+        offset = i * channels
+        for j in xrange(channels):
+            # truncate toward zero, then clamp: the output can neither exceed
+            # the ceiling nor overflow the integer sample width
+            val = int(samples[offset + j] * gain)
+            if val > max_val:
+                val = max_val
+            elif val < min_val:
+                val = min_val
+            out[offset + j] = val
+
+    return seg._spawn(data=out)
+
+
 # Invert the phase of the signal.
 
 @register_pydub_effect

@@ -1,4 +1,6 @@
 from functools import partial
+import array
+import math
 import os
 import sys
 import unittest
@@ -1329,6 +1331,199 @@ class FilterTests(unittest.TestCase):
         s = Sine(100).to_audio_segment()
         less_treble = s.low_pass_filter(800)
         self.assertAlmostEqual(less_treble.dBFS, s.dBFS, places=0)
+
+
+class LimiterTests(unittest.TestCase):
+
+    frame_rate = 8000
+    full_scale = {1: 127, 2: 32767, 4: 2147483647}
+    min_scale = {1: -128, 2: -32768, 4: -2147483648}
+    array_types = {1: 'b', 2: 'h', 4: 'i'}
+
+    def segment(self, samples, channels=1, sample_width=2):
+        return AudioSegment(
+            data=array.array(self.array_types[sample_width], samples),
+            frame_rate=self.frame_rate,
+            sample_width=sample_width,
+            channels=channels)
+
+    def ceiling(self, seg, peak_limit):
+        return seg.max_possible_amplitude * db_to_float(peak_limit)
+
+    def test_format_is_preserved(self):
+        seg = self.segment([0] * 49 + [self.full_scale[2]] + [0] * 50)
+        limited = seg.limit(peak_limit=-6.0, lookahead=5.0, release=10.0)
+
+        self.assertEqual(len(limited), len(seg))
+        self.assertEqual(limited.frame_rate, seg.frame_rate)
+        self.assertEqual(limited.channels, seg.channels)
+        self.assertEqual(limited.sample_width, seg.sample_width)
+        self.assertEqual(limited.frame_count(), seg.frame_count())
+
+    def test_impulse_is_limited_for_every_sample_width(self):
+        for sample_width in (1, 2, 4):
+            seg = self.segment(
+                [0] * 49 + [self.full_scale[sample_width]] + [0] * 50,
+                sample_width=sample_width)
+            limited = seg.limit(peak_limit=-6.0, lookahead=5.0, release=10.0)
+
+            # integer truncation can leave the sample one unit above the
+            # fractional ceiling, but never any further
+            self.assertLessEqual(
+                limited.max, math.ceil(self.ceiling(seg, -6.0)),
+                "sample width %s exceeds the ceiling" % sample_width)
+            self.assertEqual(int(limited.frame_count()), 100)
+            # the limiter must never boost a signal
+            self.assertLessEqual(limited.max, seg.max)
+
+    def test_negative_full_scale_does_not_overflow(self):
+        for sample_width in (1, 2, 4):
+            seg = self.segment(
+                [0, 0, self.min_scale[sample_width], 0, 0],
+                sample_width=sample_width)
+            limited = seg.limit(peak_limit=-3.0, lookahead=1.0, release=1.0)
+            values = list(limited.get_array_of_samples())
+
+            self.assertGreaterEqual(min(values), self.min_scale[sample_width])
+            self.assertLessEqual(
+                max(abs(v) for v in values),
+                math.ceil(self.ceiling(seg, -3.0)))
+
+    def test_lookahead_ramps_down_before_the_peak(self):
+        # 5ms lookahead at 8kHz == 40 frames of ramp ahead of the peak
+        samples = [5000] * 81
+        samples[40] = self.full_scale[2]
+        seg = self.segment(samples)
+        limited = seg.limit(peak_limit=-6.0, lookahead=5.0, release=5.0)
+        values = list(limited.get_array_of_samples())
+
+        pre_peak_gain = [values[i] / 5000.0 for i in range(0, 40)]
+        # gain decreases (weakly) all the way down toward the peak
+        self.assertTrue(all(
+            pre_peak_gain[i] >= pre_peak_gain[i + 1]
+            for i in range(len(pre_peak_gain) - 1)))
+        self.assertGreater(pre_peak_gain[0], pre_peak_gain[-1])
+        # unity gain well before the lookahead window
+        self.assertAlmostEqual(values[0] / 5000.0, 1.0, places=2)
+        # attenuation fully applied at the peak itself
+        self.assertLessEqual(
+            abs(values[40]), math.ceil(self.ceiling(seg, -6.0)))
+
+    def test_release_recovers_smoothly_after_the_peak(self):
+        seg = self.segment([self.full_scale[2]] + [5000] * 60)
+        limited = seg.limit(peak_limit=-6.0, lookahead=2.0, release=10.0)
+        values = list(limited.get_array_of_samples())
+
+        post_peak_gain = [values[i] / 5000.0 for i in range(1, 41)]
+        self.assertTrue(all(
+            post_peak_gain[i + 1] >= post_peak_gain[i]
+            for i in range(len(post_peak_gain) - 1)))
+        # fully recovered to unity gain by the end of the release window
+        self.assertAlmostEqual(post_peak_gain[-1], 1.0, places=1)
+
+    def test_stereo_uses_a_common_gain(self):
+        samples = []
+        for i in range(100):
+            samples.append(self.full_scale[2] if i == 60 else 10000)
+            samples.append(16000 if i == 60 else 5000)
+        seg = self.segment(samples, channels=2)
+        limited = seg.limit(peak_limit=-6.0, lookahead=5.0, release=20.0)
+
+        original = seg.get_array_of_samples()
+        limited_samples = limited.get_array_of_samples()
+        for i in range(0, len(original), 2):
+            if abs(original[i]) > 1000 and abs(original[i + 1]) > 1000:
+                left_gain = limited_samples[i] / float(original[i])
+                right_gain = limited_samples[i + 1] / float(original[i + 1])
+                self.assertAlmostEqual(left_gain, right_gain, places=2)
+                self.assertLessEqual(left_gain, 1.0)
+        self.assertLessEqual(
+            limited.max, math.ceil(self.ceiling(seg, -6.0)))
+        self.assertEqual(limited.channels, 2)
+
+    def test_continuous_peaks_stay_below_the_ceiling(self):
+        seg = self.segment(
+            [self.full_scale[2] if 20 <= i < 40 else 3000
+             for i in range(60)])
+        limited = seg.limit(peak_limit=-3.0, lookahead=3.0, release=3.0)
+
+        self.assertLessEqual(
+            limited.max, math.ceil(self.ceiling(seg, -3.0)))
+
+    def test_peaks_at_the_start_and_end_are_handled(self):
+        for peak_index in (0, 49):
+            samples = [0] * 50
+            samples[peak_index] = self.full_scale[2]
+            seg = self.segment(samples)
+            limited = seg.limit(peak_limit=-6.0, lookahead=5.0, release=5.0)
+
+            self.assertEqual(len(limited), len(seg))
+            self.assertEqual(int(limited.frame_count()), 50)
+            self.assertLessEqual(
+                limited.max, math.ceil(self.ceiling(seg, -6.0)))
+
+    def test_empty_and_very_short_segments(self):
+        empty = self.segment([])
+        limited_empty = empty.limit()
+        self.assertEqual(len(limited_empty), 0)
+        self.assertEqual(limited_empty.frame_count(), 0.0)
+
+        one = self.segment([self.full_scale[2]])
+        limited_one = one.limit(peak_limit=-6.0)
+        self.assertEqual(int(limited_one.frame_count()), 1)
+        self.assertLessEqual(
+            limited_one.max, math.ceil(self.ceiling(one, -6.0)))
+
+        # lookahead/release longer than the whole segment must not drop frames
+        two = self.segment([self.full_scale[2], self.full_scale[2]])
+        limited_two = two.limit(
+            peak_limit=-6.0, lookahead=100.0, release=100.0)
+        self.assertEqual(int(limited_two.frame_count()), 2)
+        self.assertLessEqual(
+            limited_two.max, math.ceil(self.ceiling(two, -6.0)))
+
+    def test_signal_below_the_ceiling_is_untouched(self):
+        seg = self.segment([1000, -1000, 0, 500])
+        limited = seg.limit(peak_limit=-1.0)
+        self.assertEqual(limited._data, seg._data)
+
+        silent = self.segment([0, 0, 0, 0], channels=2)
+        self.assertEqual(silent.limit()._data, silent._data)
+
+    def test_full_scale_ceiling_keeps_full_scale_samples(self):
+        seg = self.segment([0, self.full_scale[2], self.min_scale[2], 0])
+        limited = seg.limit(peak_limit=0.0)
+        self.assertEqual(
+            list(limited.get_array_of_samples()),
+            [0, self.full_scale[2], self.min_scale[2], 0])
+
+    def test_invalid_parameters_raise(self):
+        seg = Sine(440).to_audio_segment(duration=50)
+        invalid_kwargs = (
+            {"peak_limit": 1.0},
+            {"peak_limit": float("nan")},
+            {"peak_limit": float("inf")},
+            {"lookahead": -1.0},
+            {"lookahead": float("nan")},
+            {"release": -0.1},
+            {"release": float("inf")},
+        )
+        for kwargs in invalid_kwargs:
+            self.assertRaises(ValueError, seg.limit, **kwargs)
+
+    def test_works_on_a_real_overloaded_signal(self):
+        sine = Sine(440).to_audio_segment(duration=200).normalize(headroom=0.0)
+        overloaded = sine.overlay(sine, loop=True)
+        limited = overloaded.limit(
+            peak_limit=-1.0, lookahead=5.0, release=50.0)
+
+        self.assertEqual(len(limited), len(overloaded))
+        self.assertEqual(limited.frame_rate, overloaded.frame_rate)
+        self.assertEqual(limited.channels, overloaded.channels)
+        self.assertEqual(limited.sample_width, overloaded.sample_width)
+        self.assertLess(limited.max, overloaded.max)
+        self.assertLessEqual(
+            limited.max, math.ceil(self.ceiling(limited, -1.0)))
 
 
 class PartialAudioSegmentLoadTests(unittest.TestCase):

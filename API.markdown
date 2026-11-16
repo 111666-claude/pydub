@@ -612,6 +612,27 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).limit()
+
+A lookahead peak limiter. Attenuates the signal just enough to make sure no sample exceeds a ceiling, ramping the gain down *ahead* of each peak instead of hard-clipping it. Unlike `normalize()`, audio that stays below the ceiling is left untouched, so a signal with only a few samples over the limit is not scaled down in its entirety. The same gain is applied to every channel, preserving the stereo balance. Duration, sample rate, channels and sample width are unchanged.
+
+```python
+# keep every sample at or below -1 dBFS
+limited_sound = sound.limit(peak_limit=-1.0, lookahead=5.0, release=50.0)
+```
+
+**Supported keyword arguments**:
+
+- `peak_limit` | example: `-1.0` | default: -1.0
+  Ceiling in dBFS, relative to the maximum possible amplitude of the `AudioSegment`. Must be a finite number `<= 0`; `0.0` limits to the full-scale value of the sample width.
+
+- `lookahead` | example: `5.0` | default: 5.0
+  Look-ahead time in milliseconds. The gain starts ramping down this far before every peak, so the attenuation is fully applied by the time the peak arrives. Must be finite and `>= 0`.
+
+- `release` | example: `50.0` | default: 50.0
+  Release time in milliseconds: the minimum time the gain takes to recover back to unity after the signal falls below the ceiling. Must be finite and `>= 0`.
+
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().
