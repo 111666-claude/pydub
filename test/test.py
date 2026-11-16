@@ -1,7 +1,9 @@
 from functools import partial
+import math
 import os
 import sys
 import unittest
+from array import array
 from tempfile import (
     NamedTemporaryFile,
     mkdtemp,
@@ -11,7 +13,12 @@ import tempfile
 import struct
 
 from pydub import AudioSegment
-from pydub.audio_segment import extract_wav_headers
+from pydub.audio_segment import (
+    CROSSFADE_LINEAR,
+    CROSSFADE_EQUAL_POWER,
+    CROSSFADE_CURVES,
+    extract_wav_headers,
+)
 from pydub.utils import (
     db_to_float,
     ratio_to_db,
@@ -20,6 +27,8 @@ from pydub.utils import (
     get_encoder_name,
     get_supported_decoders,
     get_supported_encoders,
+    get_array_type,
+    audioop,
 )
 from pydub.exceptions import (
     InvalidTag,
@@ -1394,6 +1403,363 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class CrossfadeCurveTests(unittest.TestCase):
+    """
+    Tests for the crossfade curves of AudioSegment.append(). Synthetic
+    frame-aligned PCM segments are built directly so no decoder is needed and
+    every sample in the crossfade region can be checked exactly.
+    """
+
+    frame_rate = 1000  # 1 frame per millisecond, so ms == frame indices
+    segment_frames = 30
+
+    def _segment_from_frames(self, frames, channels=1, sample_width=2):
+        """
+        Build an AudioSegment from a list of per-frame sample lists, e.g.
+        [[1, 2], [3, 4]] for a two-frame stereo segment.
+        """
+        samples = [sample for frame in frames for sample in frame]
+        data = array(get_array_type(sample_width * 8), samples).tobytes()
+        return AudioSegment(
+            data,
+            metadata={
+                "channels": channels,
+                "sample_width": sample_width,
+                "frame_rate": self.frame_rate,
+                "frame_width": channels * sample_width,
+            }
+        )
+
+    def _constant_segment(self, value, frames=None, channels=1, sample_width=2):
+        frames = frames or self.segment_frames
+        return self._segment_from_frames(
+            [[value] * channels for _ in range(frames)],
+            channels=channels,
+            sample_width=sample_width,
+        )
+
+    def _sample_at(self, seg, frame_index, channel=0):
+        frame = seg.get_frame(frame_index)
+        return audioop.getsample(frame, seg.sample_width, channel)
+
+    def assertWithinTolerance(self, val, expected, tolerance=None,
+                              percentage=None):
+        if percentage is not None:
+            tolerance = expected * percentage
+        self.assertTrue(
+            abs(val - expected) <= tolerance,
+            "%s is not within %s of %s" % (val, tolerance, expected)
+        )
+
+    def test_default_curve_is_legacy_linear(self):
+        # Omitting the curve must produce byte-identical output to the
+        # original linear implementation (regression guard).
+        seg1 = self._constant_segment(4000)
+        seg2 = self._constant_segment(-4000)
+        crossfade = 8
+
+        merged_default = seg1.append(seg2, crossfade=crossfade)
+        merged_linear = seg1.append(seg2, crossfade=crossfade,
+                                    crossfade_curve=CROSSFADE_LINEAR)
+
+        legacy_xf = seg1[-crossfade:].fade(to_gain=-120, start=0, end=float('inf'))
+        legacy_xf *= seg2[:crossfade].fade(from_gain=-120, start=0, end=float('inf'))
+        legacy = seg1._spawn(
+            seg1[:-crossfade]._data + legacy_xf._data + seg2[crossfade:]._data
+        )
+
+        self.assertEqual(merged_default._data, legacy._data)
+        self.assertEqual(merged_linear._data, legacy._data)
+        self.assertEqual(len(merged_default),
+                         len(seg1) + len(seg2) - crossfade)
+
+    def test_equal_power_preserves_inputs_and_metadata(self):
+        seg1 = self._constant_segment(4000)
+        seg2 = self._constant_segment(-4000)
+        seg1_before, seg2_before = seg1._data, seg2._data
+
+        merged = seg1.append(seg2, crossfade=8,
+                             crossfade_curve=CROSSFADE_EQUAL_POWER)
+
+        # the original AudioSegments are immutable
+        self.assertEqual(seg1._data, seg1_before)
+        self.assertEqual(seg2._data, seg2_before)
+
+        # channels and sample rate metadata are carried over
+        self.assertEqual(merged.channels, seg1.channels)
+        self.assertEqual(merged.frame_rate, seg1.frame_rate)
+        self.assertEqual(merged.sample_width, seg1.sample_width)
+        self.assertEqual(len(merged), len(seg1) + len(seg2) - 8)
+
+    def test_equal_power_endpoint_frames_are_exact_sources(self):
+        seg1 = self._constant_segment(5000)
+        seg2 = self._constant_segment(-5000)
+        crossfade = 9
+        n = crossfade  # frames, frame_rate == 1000
+
+        merged = seg1.append(seg2, crossfade=crossfade,
+                             crossfade_curve=CROSSFADE_EQUAL_POWER)
+
+        # untouched material outside the crossfade region passes through
+        self.assertEqual(merged[:len(seg1) - n]._data, seg1[:-n]._data)
+        self.assertEqual(merged[len(seg1):]._data, seg2[n:]._data)
+
+        xf_start = len(seg1) - n
+        # first crossfade frame: cos(0) == 1, sin(0) == 0 -> pure seg1 frame
+        self.assertEqual(self._sample_at(merged, xf_start), 5000)
+        # last crossfade frame: cos(pi/2) == 0, sin(pi/2) == 1
+        # -> pure seg2 frame (exact, not an approximation)
+        self.assertEqual(self._sample_at(merged, xf_start + n - 1), -5000)
+
+    def test_constant_amplitude_midpoint_gains(self):
+        # Two identical constant-amplitude (fully coherent) segments.
+        # Linear ramps sum to 1 at every frame, so the amplitude is kept
+        # exactly; the equal-power ramps reach sqrt(2) at the midpoint
+        # (the known 3dB coherence boost of an equal-power crossfade).
+        amplitude = 2000
+        seg1 = self._constant_segment(amplitude)
+        seg2 = self._constant_segment(amplitude)
+        crossfade = 9  # odd number of frames -> exact midpoint frame
+
+        merged_eq = seg1.append(seg2, crossfade=crossfade,
+                                crossfade_curve=CROSSFADE_EQUAL_POWER)
+        merged_lin = seg1.append(seg2, crossfade=crossfade,
+                                 crossfade_curve=CROSSFADE_LINEAR)
+
+        xf_start = len(seg1) - crossfade
+        mid = xf_start + crossfade // 2
+
+        # equal power: cos(pi/4) + sin(pi/4) == sqrt(2)
+        self.assertAlmostEqual(
+            self._sample_at(merged_eq, mid),
+            amplitude * math.sqrt(2),
+            delta=1
+        )
+        # linear: (1 - i/n) + (i/n) == 1, frame for frame
+        self.assertAlmostEqual(
+            self._sample_at(merged_lin, mid),
+            amplitude,
+            delta=1
+        )
+        for frame_index in range(xf_start, xf_start + crossfade):
+            self.assertAlmostEqual(self._sample_at(merged_lin, frame_index),
+                                   amplitude, delta=1)
+        # both curves keep the boundary frames at the original amplitude
+        self.assertEqual(self._sample_at(merged_eq, xf_start), amplitude)
+        self.assertEqual(self._sample_at(merged_eq, xf_start + crossfade - 1),
+                         amplitude)
+
+    def test_quadrature_signal_midpoint_and_region_energy(self):
+        # A sine/cosine pair over whole periods: the two signals are
+        # sample-wise orthogonal in aggregate (mean(x1 * x2) == 0), like two
+        # independent environmental sounds. Equal-power ramps keep their
+        # combined power flat; linear ramps let it sag ~3dB at the middle.
+        n = self.segment_frames
+        amp = 10000
+        periods = 3
+        frames1, frames2 = [], []
+        for i in range(n):
+            phase = 2 * math.pi * periods * i / n
+            frames1.append([int(round(amp * math.cos(phase)))])
+            frames2.append([int(round(amp * math.sin(phase)))])
+        seg1 = self._segment_from_frames(frames1)
+        seg2 = self._segment_from_frames(frames2)
+        crossfade = n
+
+        merged_eq = seg1.append(seg2, crossfade=crossfade,
+                                crossfade_curve=CROSSFADE_EQUAL_POWER)
+        merged_lin = seg1.append(seg2, crossfade=crossfade,
+                                 crossfade_curve=CROSSFADE_LINEAR)
+
+        def rms(seg):
+            samples = array(seg.array_type, seg._data)
+            return math.sqrt(sum(s * s for s in samples) / len(samples))
+
+        # floating-point reference implementation of both ramps, so the
+        # expected energy includes weighted cross terms exactly
+        lin_ref = [
+            frames1[i][0] * (1 - i / n) + frames2[i][0] * (i / n)
+            for i in range(n)
+        ]
+        eq_ref = [
+            frames1[i][0] * math.cos((math.pi / 2) * i / (n - 1))
+            + frames2[i][0] * math.sin((math.pi / 2) * i / (n - 1))
+            for i in range(n)
+        ]
+        rms_lin_ref = math.sqrt(sum(s * s for s in lin_ref) / n)
+        rms_eq_ref = math.sqrt(sum(s * s for s in eq_ref) / n)
+
+        input_rms = rms(seg1)  # amp / sqrt(2) over whole periods
+        # equal power: region energy is preserved (cos^2 + sin^2 == 1);
+        # quantization is the only source of error against the float reference
+        self.assertWithinTolerance(rms(merged_eq), rms_eq_ref,
+                                   tolerance=rms_eq_ref * 0.01)
+        self.assertWithinTolerance(rms(merged_eq), input_rms,
+                                   tolerance=input_rms * 0.03)
+        # linear: uncorrelated power sags in the middle (~1.5-3dB dip),
+        # strictly quieter than the equal-power crossfade
+        self.assertWithinTolerance(rms(merged_lin), rms_lin_ref,
+                                   tolerance=rms_lin_ref * 0.01)
+        self.assertLess(rms(merged_lin), rms(merged_eq))
+        self.assertLess(rms(merged_lin), input_rms)
+
+        # exact midpoint frame for both curves, computed from the actual
+        # source samples and their per-frame ramp gains
+        mid = crossfade // 2
+        x1 = frames1[mid][0]
+        x2 = frames2[mid][0]
+        mid_angle = (math.pi / 2) * mid / (crossfade - 1)
+        expected_eq = int(round(
+            x1 * math.cos(mid_angle) + x2 * math.sin(mid_angle)
+        ))
+        self.assertAlmostEqual(self._sample_at(merged_eq, mid),
+                               expected_eq, delta=2)
+        expected_lin = int(round(x1 * (1 - mid / n) + x2 * (mid / n)))
+        self.assertAlmostEqual(self._sample_at(merged_lin, mid),
+                               expected_lin, delta=2)
+
+    def test_equal_power_stereo_and_all_pcm_widths(self):
+        for sample_width in (1, 2, 4):
+            # stay inside the signed range of every supported PCM width
+            # (8-bit pydub samples span -128..127)
+            amplitude = 60 if sample_width == 1 else 6000
+            seg1 = self._constant_segment(amplitude, channels=2,
+                                          sample_width=sample_width)
+            seg2 = self._constant_segment(-amplitude, channels=2,
+                                          sample_width=sample_width)
+            crossfade = 9
+
+            merged = seg1.append(seg2, crossfade=crossfade,
+                                 crossfade_curve=CROSSFADE_EQUAL_POWER)
+
+            self.assertEqual(merged.channels, 2)
+            self.assertEqual(merged.sample_width, sample_width)
+            self.assertEqual(merged.frame_rate, self.frame_rate)
+            self.assertEqual(len(merged),
+                             len(seg1) + len(seg2) - crossfade)
+
+            xf_start = len(seg1) - crossfade
+            first_frame = merged.get_frame(xf_start)
+            last_frame = merged.get_frame(xf_start + crossfade - 1)
+            for channel in range(2):
+                self.assertEqual(audioop.getsample(first_frame,
+                                                   sample_width, channel),
+                                 amplitude)
+                self.assertEqual(audioop.getsample(last_frame,
+                                                   sample_width, channel),
+                                 -amplitude)
+
+    def test_equal_power_hard_clips_peaks_to_pcm_range(self):
+        # Two full-scale segments overlap: no headroom exists in integer PCM,
+        # so the mix-down saturates at the sample-width limit instead of
+        # wrapping around (same semantics as overlay()/the linear curve).
+        max16 = 32767
+        seg1 = self._constant_segment(max16)
+        seg2 = self._constant_segment(max16)
+
+        merged = seg1.append(seg2, crossfade=9,
+                             crossfade_curve=CROSSFADE_EQUAL_POWER)
+
+        # at the midpoint both ramps sit above 0.7, so the sum would exceed
+        # the 16-bit ceiling; it must be clipped, never wrap to a negative int
+        mid = len(seg1) - 9 + 4
+        self.assertEqual(self._sample_at(merged, mid), max16)
+        self.assertTrue(all(
+            -max16 - 1 <= self._sample_at(merged, i) <= max16
+            for i in range(len(merged))
+        ))
+
+    def test_zero_crossfade_concatenates_for_every_curve(self):
+        seg1 = self._constant_segment(1000, frames=10)
+        seg2 = self._constant_segment(-1000, frames=10)
+        for curve in CROSSFADE_CURVES:
+            merged = seg1.append(seg2, crossfade=0, crossfade_curve=curve)
+            self.assertEqual(merged._data, seg1._data + seg2._data)
+            self.assertEqual(len(merged), len(seg1) + len(seg2))
+
+    def test_single_frame_crossfade_does_not_crash(self):
+        # a 1ms crossfade covers exactly one frame; the ramps must degenerate
+        # without raising (and without producing or dropping half a frame)
+        seg1 = self._constant_segment(3000, frames=5)
+        seg2 = self._constant_segment(-3000, frames=5)
+
+        for curve in CROSSFADE_CURVES:
+            merged = seg1.append(seg2, crossfade=1, crossfade_curve=curve)
+            self.assertEqual(len(merged), len(seg1) + len(seg2) - 1)
+            self.assertEqual(
+                len(merged._data),
+                (len(seg1) + len(seg2) - 1) * merged.frame_width
+            )
+
+    def test_negative_crossfade_raises(self):
+        seg1 = self._constant_segment(1000, frames=10)
+        seg2 = self._constant_segment(1000, frames=10)
+        for curve in CROSSFADE_CURVES:
+            self.assertRaises(
+                ValueError,
+                lambda: seg1.append(seg2, crossfade=-5, crossfade_curve=curve)
+            )
+
+    def test_crossfade_longer_than_either_segment_raises(self):
+        seg1 = self._constant_segment(1000, frames=10)
+        seg2 = self._constant_segment(1000, frames=6)
+        for curve in CROSSFADE_CURVES:
+            self.assertRaises(
+                ValueError,
+                lambda: seg1.append(seg2, crossfade=11, crossfade_curve=curve)
+            )
+            self.assertRaises(
+                ValueError,
+                lambda: seg2.append(seg1, crossfade=7, crossfade_curve=curve)
+            )
+
+    def test_unknown_curve_raises(self):
+        seg1 = self._constant_segment(1000, frames=10)
+        seg2 = self._constant_segment(1000, frames=10)
+        self.assertRaises(
+            ValueError,
+            lambda: seg1.append(seg2, crossfade=4, crossfade_curve="logarithmic")
+        )
+
+    def test_unalignable_crossfade_raises_without_half_frames(self):
+        # at 333Hz, 1ms is worth 0.333 frames: the crossfade cannot be split
+        # into an integer number of frames, so it must fail loudly. Build the
+        # segments with that frame rate directly (set_frame_rate would
+        # resample and change the frame count).
+        seg1 = self._segment_from_frames(
+            [[1000] for _ in range(10)]
+        )
+        seg1 = AudioSegment(
+            seg1._data,
+            metadata={
+                "channels": 1,
+                "sample_width": 2,
+                "frame_rate": 333,
+                "frame_width": 2,
+            }
+        )
+        seg2 = AudioSegment(
+            seg1._data,
+            metadata={
+                "channels": 1,
+                "sample_width": 2,
+                "frame_rate": 333,
+                "frame_width": 2,
+            }
+        )
+        seg1_before, seg2_before = seg1._data, seg2._data
+
+        for curve in CROSSFADE_CURVES:
+            self.assertRaises(
+                ValueError,
+                lambda: seg1.append(seg2, crossfade=1, crossfade_curve=curve)
+            )
+
+        # failed alignment leaves no partial output and inputs untouched
+        self.assertEqual(seg1._data, seg1_before)
+        self.assertEqual(seg2._data, seg2_before)
 
 
 if __name__ == "__main__":

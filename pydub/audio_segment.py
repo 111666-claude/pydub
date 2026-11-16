@@ -1,6 +1,7 @@
 from __future__ import division
 
 import array
+import math
 import os
 import subprocess
 from tempfile import NamedTemporaryFile
@@ -147,6 +148,12 @@ def fix_wav_headers(data):
     # Set the data size in the data subchunk
     pos = headers[-1].position
     data[pos + 4:pos + 8] = struct.pack('<I', len(data) - pos - 8)
+
+
+# Crossfade curves supported by AudioSegment.append()
+CROSSFADE_LINEAR = "linear"
+CROSSFADE_EQUAL_POWER = "equal_power"
+CROSSFADE_CURVES = (CROSSFADE_LINEAR, CROSSFADE_EQUAL_POWER)
 
 
 class AudioSegment(object):
@@ -1248,11 +1255,44 @@ class AudioSegment(object):
 
         return spawn(data=output)
 
-    def append(self, seg, crossfade=100):
+    def append(self, seg, crossfade=100, crossfade_curve=CROSSFADE_LINEAR):
+        """
+        Append a copy of ``seg`` to this segment, using a crossfade of
+        ``crossfade`` milliseconds so the two segments overlap smoothly.
+
+        crossfade (int):
+            the length (in milliseconds) of the crossfade region. When 0 (or
+            another falsy value), the two segments are simply concatenated
+            with no overlap.
+
+        crossfade_curve (str):
+            selects the gain ramp used inside the crossfade region:
+
+            - ``"linear"`` (default): the original linear fades. Kept as the
+              default so existing behavior is unchanged. Two uncorrelated
+              signals lose about 1.5-3dB of power around the midpoint (their
+              per-frame gains only sum to 1), which can be heard as a
+              momentary drop in loudness.
+            - ``"equal_power"``: sine/cosine gain ramps
+              (``cos`` for the outgoing segment, ``sin`` for the incoming one),
+              applied per sample frame. The squared gains sum to 1 at every
+              frame, preserving power through the crossfade so the midpoint no
+              longer sounds quieter. Endpoints and the total output duration
+              are identical to the linear curve.
+
+        Integer PCM is headroom-less, so the per-sample gain multiplication
+        and the mix-down both hard-clip at the limits of the sample width
+        (the same saturation semantics as ``fade()``/``overlay()``).
+        """
         seg1, seg2 = AudioSegment._sync(self, seg)
 
         if not crossfade:
             return seg1._spawn(seg1._data + seg2._data)
+        elif crossfade < 0:
+            raise ValueError(
+                "Crossfade duration must be greater than or equal to zero "
+                "({}ms given)".format(crossfade)
+            )
         elif crossfade > len(self):
             raise ValueError("Crossfade is longer than the original AudioSegment ({}ms > {}ms)".format(
                 crossfade, len(self)
@@ -1261,20 +1301,85 @@ class AudioSegment(object):
             raise ValueError("Crossfade is longer than the appended AudioSegment ({}ms > {}ms)".format(
                 crossfade, len(seg)
             ))
+        elif crossfade_curve not in CROSSFADE_CURVES:
+            raise ValueError(
+                "Unknown crossfade curve {!r}; valid curves are {}".format(
+                    crossfade_curve,
+                    ", ".join(repr(curve) for curve in CROSSFADE_CURVES)
+                )
+            )
 
-        xf = seg1[-crossfade:].fade(to_gain=-120, start=0, end=float('inf'))
-        xf *= seg2[:crossfade].fade(from_gain=-120, start=0, end=float('inf'))
+        # The crossfade must cover a whole number of sample frames in both
+        # segments, otherwise the ramps could not line up frame-for-frame and
+        # a fraction of a frame would be dropped or duplicated.
+        crossfade_frames = seg1.frame_count(ms=crossfade)
+        if crossfade_frames != int(crossfade_frames):
+            raise ValueError(
+                "Crossfade of {}ms cannot be aligned to an integer number of "
+                "sample frames at {}Hz ({} frames)".format(
+                    crossfade, seg1.frame_rate, crossfade_frames
+                )
+            )
+        crossfade_frames = int(crossfade_frames)
+
+        if crossfade_curve == CROSSFADE_EQUAL_POWER:
+            xf = self._equal_power_crossfade(seg1, seg2, crossfade_frames)
+        else:
+            xf = seg1[-crossfade:].fade(to_gain=-120, start=0, end=float('inf'))
+            xf *= seg2[:crossfade].fade(from_gain=-120, start=0, end=float('inf'))
+            xf = xf._data
 
         output = BytesIO()
 
         output.write(seg1[:-crossfade]._data)
-        output.write(xf._data)
+        output.write(xf)
         output.write(seg2[crossfade:]._data)
 
         output.seek(0)
         obj = seg1._spawn(data=output)
         output.close()
         return obj
+
+    def _equal_power_crossfade(self, seg1, seg2, frame_count):
+        """
+        Mix the tail of ``seg1`` with the head of ``seg2`` over
+        ``frame_count`` sample frames using an equal-power (sine/cosine)
+        crossfade.
+
+        The outgoing segment is scaled by ``cos(theta)`` and the incoming one
+        by ``sin(theta)`` where ``theta`` runs from 0 to ``pi / 2`` over the
+        region. The first frame therefore keeps seg1 untouched and the last
+        frame keeps seg2 untouched, and ``cos(theta) ** 2 + sin(theta) ** 2 ==
+        1`` at every frame. Both segments must already share frame rate,
+        sample width and channel count (see ``_sync``).
+
+        Returns the crossfade region as raw PCM bytes of exactly
+        ``frame_count`` frames.
+        """
+        sample_width = seg1.sample_width
+        frame_width = seg1.frame_width
+        tail = seg1._data[-frame_count * frame_width:]
+        head = seg2._data[:frame_count * frame_width]
+
+        output = BytesIO()
+        # theta runs from 0 (pure seg1) to pi / 2 (pure seg2) over the
+        # region so both boundary frames are exact source samples and the
+        # ramps line up frame-for-frame. A single-frame region degenerates
+        # to the seg1 sample, matching the linear curve's behavior.
+        angle_step = (math.pi / 2) / (frame_count - 1) if frame_count > 1 else 0
+        for i in xrange(frame_count):
+            angle = angle_step * i
+            start = i * frame_width
+            frame1 = tail[start:start + frame_width]
+            frame2 = head[start:start + frame_width]
+
+            # audioop.mul/audioop.add hard-clip to the PCM range, matching the
+            # behavior of the linear crossfade path.
+            faded_out = audioop.mul(frame1, sample_width, math.cos(angle))
+            faded_in = audioop.mul(frame2, sample_width, math.sin(angle))
+            output.write(audioop.add(faded_out, faded_in, sample_width))
+
+        return output.getvalue()
 
     def fade(self, to_gain=0, from_gain=0, start=None, end=None,
              duration=None):

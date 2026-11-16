@@ -356,12 +356,27 @@ no_crossfade1 = sound1.append(sound2, crossfade=0)
 
 # no crossfade
 no_crossfade2 = sound1 + sound2
+
+# equal-power crossfade (keeps a steady loudness through the overlap)
+equal_power = sound1.append(sound2, crossfade=5000,
+                            crossfade_curve="equal_power")
 ```
 
 **Supported keyword arguments**:
 
 - `crossfade` | example: `3000` | default: `100` (entire duration of `AudioSegment`)
   When specified, method returns number of frames in X milliseconds of the `AudioSegment`
+
+- `crossfade_curve` | example: `"equal_power"` | default: `"linear"`
+  Selects the gain ramp applied inside the crossfade region. `"linear"` (the
+  default, preserving the original behavior) fades the outgoing segment down
+  and the incoming one up on straight ramps. `"equal_power"` uses
+  sine/cosine ramps (`cos` out, `sin` in) whose squared gains sum to 1 at
+  every sample frame, so two uncorrelated sounds keep a constant power
+  through the overlap instead of dipping at the midpoint. Endpoints, the
+  crossfade duration and the total output length are identical for both
+  curves. A `ValueError` is raised for an unknown curve or a `crossfade` that
+  does not line up with an integer number of sample frames.
 
 ### AudioSegment(…).overlay()
 
