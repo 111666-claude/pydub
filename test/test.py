@@ -1,5 +1,8 @@
 from functools import partial
+import array
+import math
 import os
+import random
 import sys
 import unittest
 from tempfile import (
@@ -31,6 +34,11 @@ from pydub.exceptions import (
 from pydub.silence import (
     detect_silence,
     split_on_silence,
+)
+from pydub.phase import (
+    PhaseCorrelationWindow,
+    phase_correlation,
+    windowed_phase_correlation,
 )
 from pydub.generators import (
     Sine,
@@ -1394,6 +1402,386 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class PhaseCorrelationTests(unittest.TestCase):
+    """
+    Tests for the windowed phase correlation analysis in pydub.phase.
+
+    Fixtures are built sample by sample so the expected correlation is known
+    exactly: identical channels correlate at +1, one channel negated at -1,
+    and a sine against a cosine of the same frequency is orthogonal (0).
+    """
+
+    SAMPLE_RATE = 8000
+
+    def mono(self, samples, sample_width=2):
+        array_type = {1: 'b', 2: 'h', 4: 'i'}[sample_width]
+        data = array.array(array_type, samples)
+        return AudioSegment(
+            data.tobytes(),
+            sample_width=sample_width,
+            frame_rate=self.SAMPLE_RATE,
+            channels=1,
+        )
+
+    def stereo(self, left, right, sample_width=2):
+        return AudioSegment.from_mono_audiosegments(
+            self.mono(left, sample_width), self.mono(right, sample_width))
+
+    @staticmethod
+    def sine(freq, seconds, amplitude=10000, phase=0.0, sample_rate=8000):
+        return [
+            int(amplitude * math.sin(
+                2 * math.pi * freq * i / sample_rate + phase))
+            for i in range(int(seconds * sample_rate))
+        ]
+
+    def test_in_phase_correlation_is_one(self):
+        left = self.sine(100, 1.0)
+        seg = self.stereo(left, left)
+
+        windows = seg.phase_correlation(window=100)
+
+        self.assertEqual(len(windows), 10)
+        for i, window in enumerate(windows):
+            self.assertAlmostEqual(window.correlation, 1.0, places=9)
+            self.assertEqual(window.start_ms, i * 100.0)
+            self.assertEqual(window.end_ms, (i + 1) * 100.0)
+            self.assertFalse(window.mono_fold_risk)
+            self.assertFalse(window.silent)
+            self.assertFalse(window.partial)
+
+    def test_anti_phase_correlation_is_minus_one(self):
+        left = self.sine(100, 1.0)
+        right = [-value for value in left]
+        seg = self.stereo(left, right)
+
+        windows = seg.phase_correlation(window=100)
+
+        self.assertEqual(len(windows), 10)
+        for window in windows:
+            self.assertAlmostEqual(window.correlation, -1.0, places=9)
+            self.assertTrue(window.mono_fold_risk)
+            self.assertFalse(window.silent)
+
+    def test_orthogonal_correlation_is_zero(self):
+        left = self.sine(100, 1.0, phase=0.0)
+        right = self.sine(100, 1.0, phase=math.pi / 2)
+        seg = self.stereo(left, right)
+
+        windows = seg.phase_correlation(window=100)
+
+        self.assertEqual(len(windows), 10)
+        for window in windows:
+            self.assertAlmostEqual(window.correlation, 0.0, places=3)
+            self.assertFalse(window.mono_fold_risk)
+
+    def test_orthogonal_with_shared_dc_offset_is_still_zero(self):
+        # A common DC offset must not masquerade as correlation: the means
+        # are removed before correlating.
+        left = [value + 1500 for value in self.sine(100, 1.0)]
+        right = [value + 1500
+                 for value in self.sine(100, 1.0, phase=math.pi / 2)]
+        seg = self.stereo(left, right)
+
+        for window in seg.phase_correlation(window=100):
+            self.assertAlmostEqual(window.correlation, 0.0, places=3)
+
+    def test_local_silence_windows_are_flagged(self):
+        anti = self.sine(100, 0.5)
+        left = anti + [0] * len(anti)
+        right = [-value for value in anti] + [0] * len(anti)
+        seg = self.stereo(left, right)
+
+        windows = seg.phase_correlation(window=250)
+
+        self.assertEqual(len(windows), 4)
+        self.assertAlmostEqual(windows[0].correlation, -1.0, places=9)
+        self.assertAlmostEqual(windows[1].correlation, -1.0, places=9)
+        for window in windows[:2]:
+            self.assertTrue(window.mono_fold_risk)
+            self.assertFalse(window.silent)
+
+        for window in windows[2:]:
+            self.assertEqual(window.correlation, 0.0)
+            self.assertTrue(window.silent)
+            self.assertFalse(window.mono_fold_risk)
+
+    def test_silence_only_audio_is_silent_not_risky(self):
+        seg = AudioSegment.silent(500, frame_rate=self.SAMPLE_RATE).set_channels(2)
+        seg = seg.set_sample_width(2)
+
+        windows = seg.phase_correlation(window=100)
+
+        self.assertEqual(len(windows), 5)
+        for window in windows:
+            self.assertEqual(window.correlation, 0.0)
+            self.assertTrue(window.silent)
+            self.assertFalse(window.mono_fold_risk)
+
+    def test_one_silent_channel_has_zero_undefined_correlation(self):
+        left = self.sine(100, 0.5)
+        right = [0] * len(left)
+        seg = self.stereo(left, right)
+
+        window = seg.phase_correlation(window=250)[0]
+
+        # no division by zero; the correlation is undefined and reported as
+        # the neutral value, and the window is not "silent" because the left
+        # channel still carries signal
+        self.assertEqual(window.correlation, 0.0)
+        self.assertFalse(window.silent)
+        self.assertFalse(window.mono_fold_risk)
+
+    def test_window_and_step_intervals(self):
+        left = self.sine(100, 1.0)
+        seg = self.stereo(left, left)
+
+        windows = seg.phase_correlation(window=100, step=50)
+
+        # window 100ms, step 50ms over 1000ms: starts at 0, 50, ..., 900
+        self.assertEqual(len(windows), 19)
+        for i, window in enumerate(windows):
+            self.assertEqual(window.start_ms, i * 50.0)
+            self.assertEqual(window.end_ms, i * 50.0 + 100.0)
+            self.assertAlmostEqual(window.correlation, 1.0, places=9)
+
+    def test_overlapping_windows_use_exact_sample_boundaries(self):
+        left = self.sine(100, 1.0)
+        seg = self.stereo(left, left)
+
+        windows = seg.windowed_phase_correlation(window=10, step=10)
+
+        self.assertEqual(len(windows), 100)
+        self.assertEqual(windows[1].start_ms, 10.0)
+        self.assertEqual(windows[1].end_ms, 20.0)
+
+    def test_partial_tail_is_opt_in(self):
+        left = self.sine(100, 1.0)
+        seg = self.stereo(left, left)
+
+        full_only = seg.phase_correlation(window=300)
+        with_partial = seg.phase_correlation(window=300, include_partial=True)
+
+        self.assertEqual(len(full_only), 3)
+        self.assertEqual([w.partial for w in full_only], [False] * 3)
+        self.assertEqual(len(with_partial), 4)
+        self.assertEqual([w.partial for w in with_partial],
+                         [False, False, False, True])
+        self.assertEqual(with_partial[-1].start_ms, 900.0)
+        self.assertEqual(with_partial[-1].end_ms, 1000.0)
+
+    def test_window_longer_than_audio(self):
+        left = self.sine(100, 0.5)
+        seg = self.stereo(left, left)
+
+        self.assertEqual(seg.phase_correlation(window=2000), [])
+
+        windows = seg.phase_correlation(window=2000, include_partial=True)
+        self.assertEqual(len(windows), 1)
+        self.assertTrue(windows[0].partial)
+        self.assertEqual(windows[0].start_ms, 0.0)
+        self.assertEqual(windows[0].end_ms, 500.0)
+        self.assertAlmostEqual(windows[0].correlation, 1.0, places=9)
+
+    def test_start_and_end_limit_the_analysis(self):
+        left = self.sine(100, 1.0)
+        seg = self.stereo(left, left)
+
+        windows = seg.phase_correlation(window=100, start=200, end=500)
+
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[0].start_ms, 200.0)
+        self.assertEqual(windows[-1].end_ms, 500.0)
+
+    def test_empty_audio_returns_empty_list(self):
+        seg = AudioSegment.empty().set_channels(2)
+        self.assertEqual(seg.phase_correlation(window=100), [])
+        # also when a start/end range is given
+        self.assertEqual(seg.phase_correlation(window=100, start=0), [])
+        # plain empty segments are mono, but "no frames" is still not an
+        # error; the empty result takes precedence over the channel check
+        self.assertEqual(AudioSegment.empty().phase_correlation(window=100), [])
+
+    def test_mono_raises_value_error(self):
+        seg = self.mono(self.sine(100, 0.5))
+        with self.assertRaises(ValueError):
+            seg.phase_correlation(window=100)
+
+    def test_multichannel_raises_value_error(self):
+        mono = self.mono(self.sine(100, 0.5))
+        seg = AudioSegment.from_mono_audiosegments(mono, mono, mono)
+        with self.assertRaises(ValueError):
+            seg.phase_correlation(window=100)
+
+    def test_invalid_window_and_step(self):
+        left = self.sine(100, 0.5)
+        seg = self.stereo(left, left)
+
+        for kwargs in (
+            {"window": 0},
+            {"window": -100},
+            {"window": float("nan")},
+            {"window": float("inf")},
+            {"window": 100, "step": 0},
+            {"window": 100, "step": -10},
+            {"window": 100, "step": float("nan")},
+            {"window": 0.001},  # shorter than one sample frame at 8kHz
+        ):
+            with self.assertRaises(ValueError, msg=repr(kwargs)):
+                seg.phase_correlation(**kwargs)
+
+        for kwargs in ({"window": "100"}, {"window": None}):
+            with self.assertRaises(TypeError, msg=repr(kwargs)):
+                seg.phase_correlation(**kwargs)
+
+    def test_out_of_bounds_start_and_end(self):
+        left = self.sine(100, 0.5)
+        seg = self.stereo(left, left)
+
+        for kwargs in (
+            {"start": -1},
+            {"start": 1000},
+            {"end": 1000},
+            {"start": 400, "end": 200},
+            {"start": 400, "end": 400},
+        ):
+            with self.assertRaises(ValueError, msg=repr(kwargs)):
+                seg.phase_correlation(window=50, **kwargs)
+
+    def test_risk_threshold(self):
+        left = self.sine(100, 1.0)
+        right = self.sine(100, 1.0, phase=math.pi / 2)
+        seg = self.stereo(left, right)
+
+        # default: only negative correlation is a fold risk
+        self.assertFalse(seg.phase_correlation(window=100)[0].mono_fold_risk)
+        # an explicit threshold above zero flags weakly correlated windows
+        self.assertTrue(
+            seg.phase_correlation(window=100, risk_threshold=0.5)[0].mono_fold_risk)
+        # 1.0 is the maximum allowed threshold
+        with self.assertRaises(ValueError):
+            seg.phase_correlation(window=100, risk_threshold=1.5)
+
+    def test_window_and_step_aliases(self):
+        left = self.sine(100, 1.0)
+        seg = self.stereo(left, left)
+
+        by_alias = seg.phase_correlation(window_ms=250, step_ms=250)
+        by_name = seg.phase_correlation(window=250, step=250)
+
+        self.assertEqual(by_alias, by_name)
+        with self.assertRaises(TypeError):
+            seg.phase_correlation(window=100, window_ms=50)
+        with self.assertRaises(TypeError):
+            seg.phase_correlation(window=100, step=100, step_ms=50)
+
+    def test_correlation_always_in_unit_range(self):
+        path = os.path.join(data_dir, 'test1.wav')
+        seg = AudioSegment.from_file(path, format='wav')
+
+        windows = seg.phase_correlation(window=100, step=50)
+
+        self.assertTrue(len(windows) > 0)
+        for window in windows:
+            self.assertGreaterEqual(window.correlation, -1.0)
+            self.assertLessEqual(window.correlation, 1.0)
+
+    def test_result_can_be_read_as_attributes_dict_and_tuple(self):
+        left = self.sine(100, 0.5)
+        seg = self.stereo(left, left)
+
+        window = seg.phase_correlation(window=100)[0]
+
+        self.assertIsInstance(window, PhaseCorrelationWindow)
+        self.assertIsInstance(window, tuple)
+        self.assertEqual(window.correlation, window["correlation"])
+        self.assertEqual(window.start_ms, window[0])
+        self.assertEqual(window.start, window.start_ms)
+        self.assertEqual(window.end, window.end_ms)
+        self.assertEqual(window.risk, window.mono_fold_risk)
+        self.assertEqual(window.fold_risk, window.mono_fold_risk)
+        self.assertEqual(window.coefficient, window.correlation)
+        self.assertEqual(window.duration_ms, 100.0)
+        self.assertEqual(window.as_dict()["correlation"], window.correlation)
+        self.assertIn("correlation", repr(window))
+
+    def test_supported_sample_widths(self):
+        left = self.sine(100, 0.5, amplitude=10000)
+        for sample_width, amplitude in ((1, 50), (2, 10000), (4, 600000000)):
+            left = self.sine(100, 0.5, amplitude=amplitude)
+            right = [-value for value in left]
+            seg = self.stereo(left, right, sample_width=sample_width)
+
+            window = seg.phase_correlation(window=100)[0]
+            self.assertAlmostEqual(window.correlation, -1.0, places=6,
+                                   msg="sample width %d" % sample_width)
+
+    def test_block_processing_matches_direct_calculation(self):
+        # Longer than one internal decode block (>64KiB of PCM) so the sums
+        # must be accumulated across several blocks correctly.
+        rng = random.Random(1234)
+        left = []
+        right = []
+        for _ in range(3 * self.SAMPLE_RATE):
+            shared = rng.randint(-10000, 10000)
+            left.append(shared + rng.randint(-500, 500))
+            right.append(shared // 2 + rng.randint(-500, 500))
+        seg = self.stereo(left, right)
+
+        window = seg.phase_correlation(window=3000)[0]
+
+        n = len(left)
+        mean_l = sum(left) / float(n)
+        mean_r = sum(right) / float(n)
+        expected = (
+            sum((l - mean_l) * (r - mean_r) for l, r in zip(left, right)) /
+            math.sqrt(
+                sum((l - mean_l) ** 2 for l in left) *
+                sum((r - mean_r) ** 2 for r in right)))
+        self.assertGreater(expected, 0.0)
+        self.assertAlmostEqual(window.correlation, expected, places=9)
+
+    def test_segment_is_not_modified(self):
+        left = self.sine(100, 0.5)
+        right = [-value for value in left]
+        seg = self.stereo(left, right)
+
+        before_data = seg._data
+        before_snapshot = bytes(seg._data)
+
+        seg.phase_correlation(window=10, step=5)
+
+        self.assertIs(seg._data, before_data)
+        self.assertEqual(seg._data, before_snapshot)
+        self.assertEqual(seg.channels, 2)
+        self.assertEqual(seg.sample_width, 2)
+        self.assertEqual(seg.frame_rate, self.SAMPLE_RATE)
+
+    def test_module_function_and_method_aliases(self):
+        left = self.sine(100, 0.5)
+        seg = self.stereo(left, left)
+
+        expected = phase_correlation(seg, window=100)
+        self.assertEqual(seg.phase_correlation(window=100), expected)
+        self.assertEqual(seg.windowed_phase_correlation(window=100), expected)
+        self.assertEqual(seg.analyze_phase_correlation(window=100), expected)
+        self.assertEqual(seg.detect_phase_correlation(window=100), expected)
+        self.assertEqual(seg.phase_correlation_windows(window=100), expected)
+        self.assertEqual(windowed_phase_correlation(seg, window=100), expected)
+
+    def test_24_bit_audio_is_analyzed(self):
+        path = os.path.join(data_dir, 'test1-24bit.wav')
+        seg = AudioSegment._from_safe_wav(path)
+        self.assertEqual(seg.sample_width, 4)
+
+        windows = seg.phase_correlation(window=100)
+
+        self.assertTrue(len(windows) > 0)
+        for window in windows:
+            self.assertGreaterEqual(window.correlation, -1.0)
+            self.assertLessEqual(window.correlation, 1.0)
 
 
 if __name__ == "__main__":

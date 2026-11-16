@@ -612,6 +612,73 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+## Analysis
+
+### AudioSegment(…).phase_correlation()
+
+Measure how correlated the left and right channels of a stereo `AudioSegment` are, window by window. Out-of-phase ambience collapses when a stereo mix is folded to mono (for example, played back on a phone's single speaker), so the windows with a negative correlation are the regions where the fold-down is audible as a drop in level.
+
+The correlation is the zero-lag Pearson correlation of the two channels:
+
+```
+r = sum((L[i] - mean(L)) * (R[i] - mean(R))) /
+    sqrt(sum((L[i] - mean(L)) ** 2) * sum((R[i] - mean(R)) ** 2))
+```
+
+The means are removed first, so a shared DC offset cannot inflate the coefficient and hide an anti-phase signal. `r = 1` means the channels are in phase, `r = 0` means they are uncorrelated (folding costs about 3 dB of power) and `r = -1` means they are anti-phase (folding cancels them). The result is always in `[-1, 1]`.
+
+```python
+from pydub import AudioSegment
+
+ambience = AudioSegment.from_file("street_ambience.wav")
+
+for window in ambience.phase_correlation(window=250, step=125):
+    if window.mono_fold_risk:
+        print("%.0f-%.0f ms: r=%.3f" % (
+            window.start_ms, window.end_ms, window.correlation))
+```
+
+**Supported keyword arguments**:
+
+- `window` | example: `500` | default: `100`
+  Window length in milliseconds. `window_ms` is accepted as an alias. Must be greater than zero and at least one sample frame long.
+
+- `step` | example: `250` | default: `None`
+  Distance in milliseconds between the starts of consecutive windows. `step_ms` is accepted as an alias. `None` (the default) uses the window length, i.e. non-overlapping windows. Must be greater than zero and at least one sample frame long.
+
+- `start` | example: `5000` | default: `None`
+  Offset in milliseconds at which to start the analysis. `None` starts at the beginning.
+
+- `end` | example: `20000` | default: `None`
+  Offset in milliseconds at which to stop. `None` analyzes to the end of the segment. Values outside the audio raise `ValueError`.
+
+- `risk_threshold` | example: `0.1` | default: `0.0`
+  A window is flagged with `mono_fold_risk=True` when its correlation is below this value. The default flags exactly the negatively correlated windows, where folding to mono actually cancels signal. Must be between `-1` and `1`.
+
+- `include_partial` | example: `True` | default: `False`
+  When `True`, the remaining tail that does not fill a whole window is analyzed as one shorter window with `partial=True`. By default it is left out.
+
+The method returns a list of `PhaseCorrelationWindow` named tuples in chronological order. Each one has these fields (also readable as `window["correlation"]` or by index):
+
+- `start_ms`, `end_ms` — window boundaries in milliseconds from the start of the segment.
+- `correlation` — the measured coefficient in `[-1, 1]`.
+- `mono_fold_risk` — `True` when `correlation < risk_threshold`.
+- `silent` — `True` when both channels contain only zero samples.
+- `partial` — `True` for a shorter tail window.
+
+`start`, `end`, `risk`, `fold_risk` and `coefficient` are aliases for `start_ms`, `end_ms`, `mono_fold_risk` and `correlation`.
+
+Edge cases:
+
+- An empty segment returns `[]`.
+- Audio shorter than one window returns `[]`, or a single partial window when `include_partial=True`; a window is never silently truncated.
+- A silent window reports `correlation == 0.0`, `silent == True` and `mono_fold_risk == False`, so no division by zero occurs and silence is not reported as cancellation.
+- A window where only one channel is silent reports `correlation == 0.0` (the coefficient is undefined) but is not marked `silent`, because the other channel still carries signal.
+- Mono or multichannel segments raise `ValueError`; phase correlation is only defined between two channels, so call `set_channels(2)` first.
+- A zero, negative, non-finite or sub-frame `window`/`step` raises `ValueError` (`TypeError` for values that are not numbers), as do out-of-bounds or inverted `start`/`end`.
+
+8, 16 and 32 bit PCM is supported (pydub widens 24 bit sources to 32 bit). Only one window is read at a time, so long recordings can be analyzed without materializing the whole sample array, and the `AudioSegment` is never modified. The same function is available as `pydub.phase.phase_correlation()` and under the aliases `windowed_phase_correlation()`, `analyze_phase_correlation()`, `detect_phase_correlation()` and `phase_correlation_windows()`.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

@@ -1,3 +1,9 @@
+# v0.25.2
+- Add `AudioSegment.phase_correlation()` (module `pydub.phase`) for windowed
+  stereo phase correlation analysis: returns per-window coefficients in
+  `[-1, 1]`, mono fold-down risk flags and explicit results for silent
+  windows, empty audio, out-of-range ranges and invalid window/step sizes
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 
