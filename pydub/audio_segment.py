@@ -1,6 +1,7 @@
 from __future__ import division
 
 import array
+import math
 import os
 import subprocess
 from tempfile import NamedTemporaryFile
@@ -30,6 +31,7 @@ from .utils import (
     ratio_to_db,
     get_encoder_name,
     get_array_type,
+    get_min_max_value,
     audioop,
 )
 from .exceptions import (
@@ -87,6 +89,105 @@ AUDIO_FILE_EXT_ALIASES = {
 WavSubChunk = namedtuple('WavSubChunk', ['id', 'position', 'size'])
 WavData = namedtuple('WavData', ['audio_format', 'channels', 'sample_rate',
                                  'bits_per_sample', 'raw_data'])
+
+# Sample widths (in bytes) that the channel gain matrix mixer can process.
+# 24 bit PCM is widened to a 32 bit container (with sign extension) when an
+# AudioSegment is created, so 24 bit source material is covered by the 4 byte
+# case. Other widths (e.g. 64 bit PCM) have no integer type mapping in pydub
+# and are rejected with a clear error instead of producing partial output.
+GAIN_MATRIX_SAMPLE_WIDTHS = (1, 2, 4)
+
+# peak handling modes for apply_gain_matrix(); the aliases are accepted so
+# call sites can use whichever spelling they find clearer.
+PEAK_HANDLING_MODES = {
+    "clip": "clip",
+    "saturate": "clip",
+    "saturation": "clip",
+    "normalize": "normalize",
+    "normalise": "normalize",
+    "raise": "raise",
+    "error": "raise",
+}
+
+# Extreme products of a finite coefficient and a full scale sample can
+# overflow a float. Clamping the intermediate results keeps the peak scan and
+# the normalization arithmetic well defined.
+_MAX_MATRIX_VALUE = 1e300
+
+# apply_gain_matrix() mixes in blocks of this many frames so that memory use
+# stays proportional to the audio data itself rather than to one Python float
+# object per sample of every output channel.
+_MATRIX_BLOCK_FRAMES = 4096
+
+
+def _validate_gain_matrix(matrix, input_channels):
+    """
+    Validate a channel gain matrix and return it as a list of rows of floats.
+
+    The matrix is indexed as ``matrix[output_channel][input_channel]``. It
+    must contain at least one row and every row must contain exactly one
+    coefficient per input channel. All coefficients must be finite numbers.
+    """
+    if isinstance(matrix, (basestring, bytes, bytearray)):
+        raise TypeError(
+            "gain matrix must be a two-dimensional sequence of numbers "
+            "(rows = output channels, columns = input channels), not %s" %
+            type(matrix).__name__)
+
+    try:
+        rows = list(matrix)
+    except TypeError:
+        raise TypeError(
+            "gain matrix must be a two-dimensional sequence of numbers "
+            "(rows = output channels, columns = input channels)")
+
+    if not rows:
+        raise ValueError(
+            "gain matrix must not be empty; it needs one row per output "
+            "channel")
+
+    parsed_rows = []
+    for row_index, row in enumerate(rows):
+        if isinstance(row, (basestring, bytes, bytearray)):
+            raise TypeError(
+                "gain matrix row %d must be a sequence of %d number(s), "
+                "not %s" % (row_index, input_channels, type(row).__name__))
+        try:
+            coefficients = list(row)
+        except TypeError:
+            raise TypeError(
+                "gain matrix row %d must be a sequence of %d number(s) "
+                "(one per input channel)" % (row_index, input_channels))
+
+        if len(coefficients) != input_channels:
+            raise ValueError(
+                "gain matrix row %d has %d coefficient(s), but the "
+                "AudioSegment has %d input channel(s)" %
+                (row_index, len(coefficients), input_channels))
+
+        parsed_row = []
+        for column_index, coefficient in enumerate(coefficients):
+            if isinstance(coefficient, (basestring, bytes, bytearray)):
+                raise TypeError(
+                    "gain matrix coefficients must be numbers, not %s "
+                    "(row %d, column %d)" %
+                    (type(coefficient).__name__, row_index, column_index))
+            try:
+                value = float(coefficient)
+            except (TypeError, ValueError):
+                raise TypeError(
+                    "gain matrix coefficients must be numbers, not %s "
+                    "(row %d, column %d)" %
+                    (type(coefficient).__name__, row_index, column_index))
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError(
+                    "gain matrix coefficients must be finite "
+                    "(row %d, column %d is %r)" %
+                    (row_index, column_index, value))
+            parsed_row.append(value)
+        parsed_rows.append(parsed_row)
+
+    return parsed_rows
 
 
 def extract_wav_headers(data):
@@ -1024,7 +1125,37 @@ class AudioSegment(object):
         return self._spawn(data=converted,
                            overrides={'frame_rate': frame_rate})
 
-    def set_channels(self, channels):
+    def set_channels(self, channels, matrix=None, peak_handling="clip"):
+        """
+        Create an equivalent AudioSegment with ``channels`` channels.
+
+        The default behavior is unchanged: mono can be duplicated to any
+        number of channels and multichannel audio can be averaged down to
+        mono.
+
+        When ``matrix`` is given, the conversion uses
+        :meth:`apply_gain_matrix` instead, with ``peak_handling`` forwarded
+        to it. This makes ``set_channels(output_channels, matrix=...)`` a
+        convenient spelling for an explicit remix. ``channels`` must then
+        match the number of rows in ``matrix``.
+        """
+        if matrix is not None:
+            # a matrix may be any iterable, so materialize it once and let
+            # apply_gain_matrix() do the full validation
+            if isinstance(matrix, (basestring, bytes, bytearray)):
+                matrix_rows = None
+                row_count = None
+            else:
+                matrix_rows = list(matrix)
+                row_count = len(matrix_rows)
+            if row_count != channels:
+                raise ValueError(
+                    "channels must match the number of gain matrix rows "
+                    "(got %r channels and a matrix with %r row(s))" %
+                    (channels, row_count))
+            return self.apply_gain_matrix(matrix_rows,
+                                          peak_handling=peak_handling)
+
         if channels == self.channels:
             return self
 
@@ -1060,6 +1191,213 @@ class AudioSegment(object):
                            overrides={
                                'channels': channels,
                                'frame_width': frame_width})
+
+    def apply_gain_matrix(self, matrix, peak_handling="clip"):
+        """
+        Remix the channels of this AudioSegment with an explicit gain matrix.
+
+        ``matrix`` is a two-dimensional sequence indexed as
+        ``matrix[output_channel][input_channel]``, so it has one row per
+        output channel and exactly one column per input channel. For every
+        sample frame the output sample for channel ``o`` is::
+
+            out[o] = matrix[o][0] * in[0] + ... + matrix[o][n-1] * in[n-1]
+
+        Coefficients may be negative (phase inversion), zero (dropping a
+        channel) or greater than 1 (gain). A mono input can be duplicated,
+        a multichannel input can be downmixed to stereo, and a segment can
+        be upmixed to any number of output channels.
+
+        ``peak_handling`` selects what happens when a mixed sample falls
+        outside the integer range of the segment's sample width:
+
+        - ``"clip"`` (default): saturate the sample to the nearest valid
+          value. Simple and deterministic, but loud mixes are clipped.
+        - ``"normalize"``: apply one common attenuation factor to the whole
+          output so that the loudest mixed sample reaches, but does not
+          exceed, full scale. The relative level of the output channels is
+          preserved. The output is never boosted.
+        - ``"raise"``: raise ``ValueError`` if any mixed sample would
+          overflow instead of silently altering it.
+
+        The original segment is never modified. The returned segment keeps
+        the sample rate, sample width and frame count of the input and has
+        ``len(matrix)`` channels, so slicing, appending and exporting behave
+        exactly as they do for any other AudioSegment.
+
+        8, 16 and 32 bit integer PCM are supported. 24 bit PCM is already
+        stored by pydub in a 32 bit container (with the 24 bit value range
+        preserved), so 24 bit material is handled by the 4 byte case.
+
+        Raises ``ValueError`` for an empty matrix, a matrix whose rows do
+        not have one coefficient per input channel, non-finite (NaN/inf)
+        coefficients, an unsupported sample width, an unknown peak handling
+        mode or data that does not contain a whole number of frames.
+        """
+        try:
+            resolved_peak_handling = PEAK_HANDLING_MODES[peak_handling]
+        except (KeyError, TypeError):
+            raise ValueError(
+                "peak_handling must be one of %s, got %r" %
+                (", ".join(repr(mode) for mode in ("clip", "normalize", "raise")),
+                 peak_handling))
+        peak_handling = resolved_peak_handling
+
+        if self.sample_width not in GAIN_MATRIX_SAMPLE_WIDTHS:
+            raise ValueError(
+                "apply_gain_matrix() does not support a sample width of "
+                "%r (%s-bit PCM); supported widths are 1, 2 and 4 bytes" %
+                (self.sample_width,
+                 None if self.sample_width is None else self.sample_width * 8))
+
+        input_channels = self.channels
+        weights = _validate_gain_matrix(matrix, input_channels)
+        output_channels = len(weights)
+
+        if self.frame_width != input_channels * self.sample_width:
+            raise ValueError(
+                "AudioSegment frame_width (%r) is inconsistent with its "
+                "channel count (%r) and sample width (%r)" %
+                (self.frame_width, input_channels, self.sample_width))
+
+        if len(self._data) % self.frame_width != 0:
+            raise ValueError(
+                "AudioSegment data does not contain a whole number of "
+                "frames (%d bytes for a frame width of %d bytes)" %
+                (len(self._data), self.frame_width))
+
+        frame_count = int(self.frame_count())
+        sample_width = self.sample_width
+        min_val, max_val = get_min_max_value(sample_width * 8)
+        sample_type = self.array_type
+
+        # The interleaved samples, and a helper that extracts just one
+        # channel's samples for a block of frames. Slicing per block (rather
+        # than de-interleaving the whole input up front) keeps peak memory
+        # proportional to the segment size instead of a multiple of it.
+        samples = self.get_array_of_samples()
+
+        def channel_block(column_index, block_start, block_end):
+            first = block_start * input_channels + column_index
+            stop = block_end * input_channels
+            return samples[first:stop:input_channels]
+
+        # A finite coefficient can still be large enough to overflow when
+        # multiplied by a full scale sample. Clamping it to a value that
+        # keeps every product (and the sum of products) finite changes
+        # nothing that would not have saturated anyway.
+        sample_bound = max(abs(min_val), abs(max_val))
+        coefficient_limit = _MAX_MATRIX_VALUE / (
+            sample_bound * max(1, input_channels))
+
+        # Drop zero coefficients up front: they contribute nothing and
+        # dropping them lets the inner loop skip entire input channels.
+        active_rows = []
+        for row in weights:
+            active_row = []
+            for column_index, coefficient in enumerate(row):
+                if coefficient == 0.0:
+                    continue
+                if coefficient > coefficient_limit:
+                    coefficient = coefficient_limit
+                elif coefficient < -coefficient_limit:
+                    coefficient = -coefficient_limit
+                active_row.append((coefficient, column_index))
+            active_rows.append(active_row)
+
+        def mixed_blocks():
+            """
+            Yield ``(start, values)`` for each block of frames, where
+            ``values[output_channel][offset]`` holds the unclipped, unrounded
+            mix for that frame. Blocks keep memory use independent of the
+            segment length and of the number of output channels.
+            """
+            for block_start in xrange(0, frame_count, _MATRIX_BLOCK_FRAMES):
+                block_end = min(block_start + _MATRIX_BLOCK_FRAMES, frame_count)
+                block_length = block_end - block_start
+                block_values = []
+                for active_row in active_rows:
+                    if not active_row:
+                        block_values.append([0.0] * block_length)
+                        continue
+                    coefficient, column_index = active_row[0]
+                    values = [
+                        coefficient * sample
+                        for sample in channel_block(
+                            column_index, block_start, block_end)
+                    ]
+                    for coefficient, column_index in active_row[1:]:
+                        extra = channel_block(
+                            column_index, block_start, block_end)
+                        values = [
+                            value + coefficient * sample
+                            for value, sample in zip(values, extra)
+                        ]
+                    block_values.append(values)
+                yield block_start, block_values
+
+        def round_and_clip(value, scale=1.0):
+            """Round half away from zero, then saturate to the sample range."""
+            if scale != 1.0:
+                value *= scale
+            if value >= max_val:
+                return max_val
+            if value <= min_val:
+                return min_val
+            if value >= 0:
+                return int(math.floor(value + 0.5))
+            return int(math.ceil(value - 0.5))
+
+        scale = 1.0
+        if peak_handling != "clip":
+            # Determine the largest positive and negative excursions first,
+            # so "normalize" can attenuate the entire mix uniformly and
+            # "raise" can refuse to alter the signal at all.
+            positive_peak = 0.0
+            negative_peak = 0.0
+            for _, block_values in mixed_blocks():
+                for values in block_values:
+                    for value in values:
+                        if value > positive_peak:
+                            positive_peak = value
+                        elif value < negative_peak:
+                            negative_peak = value
+            if positive_peak > max_val or negative_peak < min_val:
+                if peak_handling == "raise":
+                    raise ValueError(
+                        "remixed audio exceeds the %d-bit sample range "
+                        "(peak %.6g, allowed %.6g to %.6g); use "
+                        "peak_handling='clip' or 'normalize' to allow "
+                        "saturation" % (sample_width * 8, max(
+                            positive_peak, -negative_peak), min_val, max_val))
+                if positive_peak > max_val:
+                    scale = min(scale, max_val / positive_peak)
+                if negative_peak < min_val:
+                    scale = min(scale, min_val / negative_peak)
+
+        converted = array.array(
+            sample_type, b'\0' * (frame_count * output_channels * sample_width))
+        for block_start, block_values in mixed_blocks():
+            block_length = len(block_values[0]) if block_values else 0
+            for output_channel, values in enumerate(block_values):
+                first = block_start * output_channels + output_channel
+                stop = first + block_length * output_channels
+                converted[first:stop:output_channels] = array.array(
+                    sample_type,
+                    [round_and_clip(value, scale) for value in values])
+
+        return self._spawn(
+            data=converted,
+            overrides={
+                'channels': output_channels,
+                'frame_width': output_channels * sample_width,
+            })
+
+    # Convenience aliases: "remix" and "mix_matrix" read naturally in call
+    # sites that are downmixing/upmixing with a gain matrix.
+    remix = apply_gain_matrix
+    mix_matrix = apply_gain_matrix
+    apply_channel_matrix = apply_gain_matrix
 
     def split_to_mono(self):
         if self.channels == 1:

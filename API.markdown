@@ -481,6 +481,72 @@ Creates an equivalent version of this `AudioSegment` with the specified frame ra
 
 Creates an equivalent version of this `AudioSegment` with the specified number of channels (1 is Mono, 2 is Stereo). Converting from mono to stereo does not cause any audible change. Converting from stereo to mono may result in loss of quality (but only if the left and right chanels differ).
 
+`set_channels()` always uses its own fixed rules (duplicate mono channels, or
+average when reducing to mono). To mix channels with explicit coefficients,
+use [`apply_gain_matrix()`](#audiosegmentapply_gain_matrix) below — or pass
+the matrix directly: `sound.set_channels(2, matrix=[[0.75, 0.25], [0.25, 0.75]])`.
+In that form `channels` must equal the number of matrix rows, and any
+`peak_handling` value is forwarded to `apply_gain_matrix()`.
+
+### AudioSegment(…).apply_gain_matrix()
+
+Remix the channels of an `AudioSegment` with an explicit gain matrix, for
+example to fold a surround/multichannel stem down to stereo using the
+coefficients supplied by a client, or to upmix mono to several channels.
+
+The matrix is indexed as `matrix[output_channel][input_channel]`: it has one
+row per output channel and exactly one column per input channel. Each output
+frame is computed from the input frame as:
+
+```
+out[o] = matrix[o][0] * in[0] + ... + matrix[o][n-1] * in[n-1]
+```
+
+Coefficients may be negative (phase inversion), zero (drop an input channel)
+or above 1 (gain). The mix is calculated per frame from the de-interleaved
+input samples; the original segment is never modified.
+
+```python
+from pydub import AudioSegment
+
+surround = AudioSegment.from_file("cutscene.wav")  # e.g. 4-channel stem
+
+# fold L, R, Ls, Rs to stereo with the client's coefficients
+stereo = surround.apply_gain_matrix([
+    [0.75, 0.25, 0.00, 0.00],   # left
+    [0.25, 0.75, 0.00, 0.00],   # right
+])
+
+# mid/side: sum and difference of the two input channels
+mid_side = stereo.apply_gain_matrix([[0.5, 0.5], [0.5, -0.5]])
+```
+
+**`peak_handling`** decides what happens to mixed samples that fall outside
+the integer range of the sample width:
+
+- `"clip"` (default) — saturate each sample to the nearest valid value. This
+  is deterministic but audibly clips loud mixes.
+- `"normalize"` — compute the mix first, then apply one common attenuation
+  factor so that the loudest sample reaches full scale. This preserves the
+  relative level of every output channel and never boosts the signal.
+- `"raise"` — raise `ValueError` if any mixed sample would overflow.
+
+`apply_gain_matrix()` supports 8, 16 and 32 bit integer PCM. 24 bit PCM is
+already held by pydub in a sign-extended 32 bit container, so it is covered
+by the 32 bit case and the 24 bit dynamic range is preserved. The output has
+the same frame rate, sample width and frame count as the input, with
+`len(matrix)` channels, so slicing, appending and exporting behave exactly
+as for any other `AudioSegment`.
+
+An empty matrix, a row whose length is not the input channel count, a
+non-sequence matrix or row, non-finite (NaN/inf) or non-numeric
+coefficients, an unsupported sample width and an unknown `peak_handling`
+value all raise `ValueError`/`TypeError` before any output is produced.
+
+`AudioSegment(…).remix()`, `mix_matrix()` and `apply_channel_matrix()` are
+aliases for `apply_gain_matrix()`, so the operation reads naturally at call
+sites that describe themselves as remixing or channel-matrix mixing.
+
 ### AudioSegment(…).split_to_mono()
 
 Splits a stereo `AudioSegment` into two, one for each channel (Left/Right). Returns a list with the new `AudioSegment` objects with the left channel at index 0 and the right channel at index 1.

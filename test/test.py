@@ -1086,13 +1086,452 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
 
         tempfile.tempdir = orig_tmpdir
         os.rmdir(new_tmpdir)
+
+
+class GainMatrixTests(unittest.TestCase):
+    """Tests for AudioSegment.apply_gain_matrix() / AudioSegment.remix()."""
+
+    SAMPLE_WIDTHS = (1, 2, 4)
+    SAMPLE_VALUES = {1: 100, 2: 1000, 4: 100000}
+
+    def make_segment(self, channel_samples, sample_width=2, channels=None,
+                     frame_rate=8000):
+        """
+        Build an AudioSegment from a list of per-channel sample lists.
+        Samples are interleaved frame by frame, just like real PCM data.
+        """
+        if channels is None:
+            channels = len(channel_samples)
+
+        frame_count = len(channel_samples[0])
+        for channel in channel_samples:
+            self.assertEqual(len(channel), frame_count)
+
+        format_char = {1: 'b', 2: 'h', 4: 'i'}[sample_width]
+        interleaved = []
+        for frame in range(frame_count):
+            for channel in range(channels):
+                interleaved.append(channel_samples[channel][frame])
+
+        data = struct.pack('<%d%s' % (len(interleaved), format_char),
+                           *interleaved)
+        return AudioSegment(data=data, sample_width=sample_width,
+                            frame_rate=frame_rate, channels=channels)
+
+    def samples_of(self, seg):
+        return list(seg.get_array_of_samples())
+
+    def test_mono_impulse_locates_each_column(self):
+        for sample_width in self.SAMPLE_WIDTHS:
+            amplitude = self.SAMPLE_VALUES[sample_width]
+            mono = self.make_segment([[amplitude, 0, 0, 0]],
+                                     sample_width=sample_width, channels=1)
+
+            # one output channel per matrix row, each reading only column 0
+            out = mono.apply_gain_matrix([[1.0], [0.5], [-1.0], [0.0]])
+            self.assertEqual(out.channels, 4)
+            self.assertEqual(out.frame_count(), mono.frame_count())
+            self.assertEqual(out.sample_width, sample_width)
+            self.assertEqual(out.frame_width, 4 * sample_width)
+
+            samples = self.samples_of(out)
+            frame_count = int(out.frame_count())
+            first_frame = samples[:4]
+            self.assertEqual(first_frame, [amplitude, amplitude // 2,
+                                           -amplitude, 0])
+            for frame in range(1, frame_count):
+                self.assertEqual(samples[frame * 4:frame * 4 + 4], [0, 0, 0, 0])
+
+    def test_interleaved_multichannel_geometry(self):
+        # 3 input channels with distinct values per frame
+        seg = self.make_segment([[100, -200, 300],
+                                 [1000, -2000, 3000],
+                                 [-10, 20, -30]])
+
+        # four output channels, each selecting a different input column
+        out = seg.apply_gain_matrix([
+            [1, 0, 0],   # input 0 only
+            [0, 1, 0],   # input 1 only
+            [0, 0, 1],   # input 2 only
+            [0, 0, 0],   # silence
+        ])
+
+        self.assertEqual(out.channels, 4)
+        self.assertEqual(out.frame_width, 4 * seg.sample_width)
+        self.assertEqual(out.frame_count(), seg.frame_count())
+        self.assertEqual(self.samples_of(out),
+                         [100, 1000, -10, 0,
+                          -200, -2000, 20, 0,
+                          300, 3000, -30, 0])
+
+    def test_write_channels_are_not_swapped(self):
+        # left = small, right = large; a diagonal matrix must preserve order
+        seg = self.make_segment([[10, 20, 30], [1000, 2000, 3000]])
+        out = seg.apply_gain_matrix([[1, 0], [0, 1]])
+        self.assertEqual(self.samples_of(out), [10, 1000, 20, 2000, 30, 3000])
+
+    def test_negative_coefficients_invert_phase(self):
+        seg = self.make_segment([[1000, -2000], [3000, -4000]])
+        out = seg.apply_gain_matrix([[-1, 0], [0, -1]])
+        self.assertEqual(self.samples_of(out), [-1000, -3000, 2000, 4000])
+
+        # difference signal (mid/side style): L - R and R - L
+        out = seg.apply_gain_matrix([[1, -1], [-1, 1]])
+        self.assertEqual(self.samples_of(out), [-2000, 2000, 2000, -2000])
+
+    def test_rounding_half_away_from_zero(self):
+        seg = self.make_segment([[3, -3, 1, -1], [5, -5, 7, -7]])
+        out = seg.apply_gain_matrix([[0.5, 0], [0, 0.5], [0.5, 0.5]])
+        # 3*0.5=1.5 -> 2, -3*0.5=-1.5 -> -2, 1*0.5=0.5 -> 1, -1*0.5=-0.5 -> -1
+        # sums: 4 -> 4, -4 -> -4, 4 -> 4, -4 -> -4
+        self.assertEqual(self.samples_of(out),
+                         [2, 3, 4, -2, -3, -4, 1, 4, 4, -1, -4, -4])
+
+    def test_clipping_saturates_at_full_scale(self):
+        for sample_width in self.SAMPLE_WIDTHS:
+            max_val = 2 ** (sample_width * 8 - 1) - 1
+            min_val = -2 ** (sample_width * 8 - 1)
+            seg = self.make_segment([[max_val, min_val]],
+                                    sample_width=sample_width, channels=1)
+
+            out = seg.apply_gain_matrix([[2.0]])
+            self.assertEqual(self.samples_of(out), [max_val, min_val])
+
+            out = seg.apply_gain_matrix([[-2.0]])
+            self.assertEqual(self.samples_of(out), [min_val, max_val])
+
+    def test_clipping_multi_channel_sum(self):
+        max_val = 32767
+        min_val = -32768
+        seg = self.make_segment([[20000, -20000, 100],
+                                 [20000, -20000, -100]])
+
+        out = seg.apply_gain_matrix([[1, 1]])
+        self.assertEqual(self.samples_of(out), [max_val, min_val, 0])
+
+    def test_normalize_peak_handling(self):
+        seg = self.make_segment([[20000, 10000, -5000],
+                                 [20000, 10000, -5000]])
+
+        out = seg.apply_gain_matrix([[1, 1]], peak_handling="normalize")
+        samples = self.samples_of(out)
+
+        # full scale should not be exceeded, and the loudest sample should
+        # reach full scale (the common factor is exactly 32767/40000)
+        self.assertEqual(samples[0], 32767)
+        self.assertLessEqual(max(samples), 32767)
+        self.assertGreaterEqual(min(samples), -32768)
+
+        # relative levels are preserved: 10000/20000 == 16383/32767 approx
+        self.assertAlmostEqual(samples[1] / float(samples[0]), 0.5, places=3)
+        self.assertAlmostEqual(samples[2] / float(samples[0]), -0.25, places=3)
+
+    def test_normalize_keeps_stereo_balance(self):
+        seg = self.make_segment([[30000], [10000]])
+        out = seg.apply_gain_matrix([[1, 0], [0, 1]], peak_handling="normalize")
+
+        # nothing overflows, so normalize must be an exact identity
+        self.assertEqual(self.samples_of(out), [30000, 10000])
+
+        out = seg.apply_gain_matrix([[2, 0], [0, 2]], peak_handling="normalize")
+        self.assertEqual(self.samples_of(out), [32767, 10922])
+
+    def test_normalize_never_boosts(self):
+        seg = self.make_segment([[100, -100]], channels=1)
+        out = seg.apply_gain_matrix([[1.0]], peak_handling="normalize")
+        self.assertEqual(self.samples_of(out), [100, -100])
+
+    def test_raise_peak_handling(self):
+        seg = self.make_segment([[20000, 20000], [20000, 20000]])
+
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1, 1]], peak_handling="raise")
+
+        # no overflow -> no error
+        out = seg.apply_gain_matrix([[0.5, 0.5]], peak_handling="raise")
+        self.assertEqual(self.samples_of(out), [20000, 20000])
+
+    def test_frame_count_rate_and_width_are_preserved(self):
+        seg = self.make_segment([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]],
+                                sample_width=2, frame_rate=44100)
+        out = seg.apply_gain_matrix([[1, 1], [1, 0], [0, 1]])
+
+        self.assertEqual(out.frame_rate, 44100)
+        self.assertEqual(out.sample_width, 2)
+        self.assertEqual(out.frame_count(), seg.frame_count())
+        self.assertEqual(len(out), len(seg))
+        self.assertEqual(out.frame_width, 3 * 2)
+
+    def test_original_segment_is_not_modified(self):
+        seg = self.make_segment([[1000, -1000], [2000, -2000]])
+        original_data = bytes(seg._data)
+        original_samples = self.samples_of(seg)
+
+        seg.apply_gain_matrix([[0, 1], [1, 0], [1, -1]])
+        seg.apply_gain_matrix([[10, 10]], peak_handling="normalize")
+        seg.apply_gain_matrix([[-1, -1]], peak_handling="clip")
+
+        self.assertEqual(bytes(seg._data), original_data)
+        self.assertEqual(self.samples_of(seg), original_samples)
+        self.assertEqual(seg.channels, 2)
+
+    def test_slicing_keeps_channel_metadata(self):
+        seg = self.make_segment([[100, 200, 300, 400, 500],
+                                 [1000, 2000, 3000, 4000, 5000]])
+        out = seg.apply_gain_matrix([[1, 1], [1, -1], [0.5, 0]])
+
+        sliced = out[:0]
+        self.assertEqual(sliced.channels, 3)
+        self.assertEqual(sliced.frame_width, 3 * seg.sample_width)
+        self.assertEqual(sliced.frame_count(), 0)
+
+        # frame aligned slice keeps the full frame structure
+        one_ms = out[0:1]
+        self.assertEqual(one_ms.channels, 3)
+        self.assertEqual(one_ms.frame_width, 3 * seg.sample_width)
+        self.assertEqual(one_ms.frame_count(), seg.frame_count(ms=1))
+
+        # slicing at an arbitrary millisecond boundary still splits on whole
+        # frames, so every resulting sample belongs to a complete frame
+        tail = out[out.frame_count(ms=1):]
+        self.assertEqual(tail.channels, 3)
+        self.assertEqual(len(tail._data) % tail.frame_width, 0)
+        self.assertEqual(tail.frame_width, 3 * seg.sample_width)
+
+    def test_append_keeps_channel_metadata(self):
+        seg = self.make_segment([[1000, -1000], [2000, -2000]])
+        out = seg.apply_gain_matrix([[1, 1], [1, -1]])
+
+        appended = out + out
+        self.assertEqual(appended.channels, 2)
+        self.assertEqual(appended.frame_width, 2 * seg.sample_width)
+        self.assertEqual(appended.frame_count(), 2 * out.frame_count())
+        self.assertEqual(appended.frame_rate, out.frame_rate)
+        self.assertEqual(appended.sample_width, out.sample_width)
+
+    def test_export_round_trip_keeps_channel_metadata(self):
+        seg = self.make_segment([[1000, -1000], [2000, -2000],
+                                 [3000, -3000]], sample_width=2,
+                                frame_rate=22050)
+        out = seg.apply_gain_matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1],
+                                     [0.5, 0.5, 0]])
+
+        with NamedTemporaryFile('w+b', suffix='.wav') as tmp_file:
+            out.export(tmp_file, format='wav')
+            tmp_file.seek(0)
+            reloaded = AudioSegment.from_wav(tmp_file)
+
+        self.assertEqual(reloaded.channels, 4)
+        self.assertEqual(reloaded.frame_width, 4 * 2)
+        self.assertEqual(reloaded.frame_rate, out.frame_rate)
+        self.assertEqual(reloaded.sample_width, out.sample_width)
+        self.assertEqual(reloaded.frame_count(), out.frame_count())
+        # channel order survives the round trip
+        self.assertEqual(self.samples_of(reloaded), self.samples_of(out))
+
+    def test_empty_segment(self):
+        for sample_width in self.SAMPLE_WIDTHS:
+            empty = AudioSegment(data=b'', sample_width=sample_width,
+                                 frame_rate=8000, channels=1)
+            out = empty.apply_gain_matrix([[1.0], [0.5]],
+                                          peak_handling="normalize")
+            self.assertEqual(out.channels, 2)
+            self.assertEqual(out.frame_width, 2 * sample_width)
+            self.assertEqual(out.frame_count(), 0)
+            self.assertEqual(len(out._data), 0)
+
+    def test_identity_matrix_matches_input(self):
+        seg = self.make_segment([[100, -200, 300], [400, -500, 600]])
+        out = seg.apply_gain_matrix([[1, 0], [0, 1]])
+        self.assertEqual(self.samples_of(out), self.samples_of(seg))
+
+    def test_matrix_can_be_any_iterable(self):
+        seg = self.make_segment([[10, 20, 30], [1, 2, 3]])
+
+        out = seg.apply_gain_matrix((row for row in ([1, 0], [0, 1])))
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(self.samples_of(out), self.samples_of(seg))
+
+        out = seg.apply_gain_matrix(([1, 0], (0, 1)))
+        self.assertEqual(out.channels, 2)
+
+    def test_remix_alias(self):
+        seg = self.make_segment([[100, 200], [300, 400]])
+        self.assertEqual(self.samples_of(seg.remix([[1, 1]])),
+                         self.samples_of(seg.apply_gain_matrix([[1, 1]])))
+
+    def test_upmix_to_stereo_matches_set_channels_for_mono(self):
+        mono = self.make_segment([[1000, -1000, 500]], channels=1)
+        out = mono.apply_gain_matrix([[1], [1]])
+        copied = mono.set_channels(2)
+
+        self.assertEqual(out.channels, copied.channels)
+        self.assertEqual(out.frame_width, copied.frame_width)
+        self.assertEqual(self.samples_of(out), self.samples_of(copied))
+
+    def test_set_channels_accepts_explicit_matrix(self):
+        seg = self.make_segment([[1000, -1000], [2000, -2000]])
+        mono = self.make_segment([[1000, -1000]], channels=1)
+
+        # the default set_channels() behavior is untouched
+        self.assertEqual(seg.set_channels(1).channels, 1)
+        self.assertEqual(seg.set_channels(2).channels, 2)
+        self.assertEqual(mono.set_channels(4).channels, 4)
+        with self.assertRaises(ValueError):
+            # still unsupported by the default implementation
+            seg.set_channels(4)
+
+        # the matrix form produces exactly the same result as the explicit
+        # apply_gain_matrix() call
+        out = seg.set_channels(2, matrix=[[1, -1], [-1, 1]],
+                               peak_handling="normalize")
+        expected = seg.apply_gain_matrix([[1, -1], [-1, 1]],
+                                         peak_handling="normalize")
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(self.samples_of(out), self.samples_of(expected))
+
+        # a matrix also permits conversions the fixed rules don't support
+        upmixed = seg.set_channels(4, matrix=[[1, 0], [0, 1], [1, 1], [0, 0]])
+        self.assertEqual(upmixed.channels, 4)
+
+        # channel count and matrix row count must agree
+        with self.assertRaises(ValueError):
+            seg.set_channels(3, matrix=[[1, 0], [0, 1]])
+
+    def test_empty_matrix_is_rejected(self):
+        seg = self.make_segment([[100, 200]])
+
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([])
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix(())
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[]])
+
+    def test_dimension_mismatch_is_rejected(self):
+        seg = self.make_segment([[100, 200], [300, 400]])
+
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1]])
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1, 0], [1]])
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1, 0, 0]])
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1, 0], []])
+
+    def test_row_must_be_sequence(self):
+        seg = self.make_segment([[100, 200], [300, 400]])
+
+        with self.assertRaises(TypeError):
+            seg.apply_gain_matrix([1, 2])
+        with self.assertRaises(TypeError):
+            seg.apply_gain_matrix([[1, 0], 5])
+
+    def test_non_sequence_matrix_is_rejected(self):
+        seg = self.make_segment([[100, 200]])
+        for bad_matrix in (5, None, "12", b"12"):
+            with self.assertRaises(TypeError):
+                seg.apply_gain_matrix(bad_matrix)
+
+    def test_non_finite_coefficients_are_rejected(self):
+        seg = self.make_segment([[100, 200], [300, 400]])
+
+        for bad_value in (float('nan'), float('inf'), float('-inf')):
+            with self.assertRaises(ValueError):
+                seg.apply_gain_matrix([[bad_value, 1]])
+            with self.assertRaises(ValueError):
+                seg.apply_gain_matrix([[1, 0], [0, bad_value]])
+
+    def test_non_numeric_coefficients_are_rejected(self):
+        seg = self.make_segment([[100, 200], [300, 400]])
+        with self.assertRaises(TypeError):
+            seg.apply_gain_matrix([["1", 0]])
+        with self.assertRaises(TypeError):
+            seg.apply_gain_matrix([[None, 0]])
+
+    def test_unsupported_sample_width_is_rejected(self):
+        # 64-bit PCM has no integer array type mapping in pydub
+        seg = AudioSegment(data=b'\0' * 8, sample_width=8, frame_rate=8000,
+                           channels=1)
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1.0]])
+
+    def test_invalid_peak_handling_is_rejected(self):
+        seg = self.make_segment([[100, 200]])
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1.0]], peak_handling="limit")
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1.0]], peak_handling=None)
+        with self.assertRaises(ValueError):
+            seg.apply_gain_matrix([[1.0]], peak_handling=["clip"])
+
+    def test_peak_handling_aliases(self):
+        seg = self.make_segment([[20000, -20000]], channels=1)
+        clipped = seg.apply_gain_matrix([[2.0]], peak_handling="clip")
+        for alias in ("saturate", "saturation"):
+            self.assertEqual(
+                self.samples_of(seg.apply_gain_matrix([[2.0]],
+                                                      peak_handling=alias)),
+                self.samples_of(clipped))
+        normalized = seg.apply_gain_matrix([[2.0]], peak_handling="normalize")
+        self.assertEqual(
+            self.samples_of(seg.apply_gain_matrix([[2.0]],
+                                                  peak_handling="normalise")),
+            self.samples_of(normalized))
+        for alias in ("raise", "error"):
+            with self.assertRaises(ValueError):
+                seg.apply_gain_matrix([[2.0]], peak_handling=alias)
+
+    def test_result_is_deterministic(self):
+        seg = self.make_segment([[12345, -13456, 14567],
+                                 [-15678, 16789, -17890]])
+        matrix = [[0.3, -0.7], [1.25, 0.5]]
+        first = seg.apply_gain_matrix(matrix, peak_handling="normalize")
+        second = seg.apply_gain_matrix(matrix, peak_handling="normalize")
+        self.assertEqual(bytes(first._data), bytes(second._data))
+
+    def test_partial_frames_are_rejected(self):
+        # Normal construction refuses data that is not a whole number of
+        # frames, but the mixer also guards against a segment whose frame
+        # width and data length have become inconsistent.
+        partial = AudioSegment(data=b'\0' * 4, sample_width=2,
+                               frame_rate=8000, channels=1)
+        partial._data = b'\0' * 3
+        with self.assertRaises(ValueError):
+            partial.apply_gain_matrix([[1.0]])
+        # the failed call must not have produced a half frame anywhere
+        self.assertEqual(len(partial._data), 3)
+
+    def test_24_bit_audio_is_remixed_in_its_32_bit_container(self):
+        path24 = os.path.join(data_dir, 'test1-24bit.wav')
+        seg = AudioSegment.from_wav(path24)
+
+        # pydub stores 24-bit PCM in a 32-bit container
+        self.assertEqual(seg.sample_width, 4)
+
+        # stereo -> stereo with a mid/side style matrix
+        out = seg.apply_gain_matrix([[0.5, 0.5], [0.5, -0.5]])
+        self.assertEqual(out.sample_width, 4)
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(out.frame_width, 8)
+        self.assertEqual(out.frame_count(), seg.frame_count())
+        self.assertEqual(len(out._data), len(seg._data))
+
+        # mid + side reconstructs the original (allowing for rounding)
+        round_trip = out.apply_gain_matrix([[1, 1], [1, -1]])
+        orb = self.samples_of(seg)
+        rtb = self.samples_of(round_trip)
+        self.assertEqual(len(orb), len(rtb))
+        max_error = max(abs(a - b) for a, b in zip(orb, rtb))
+        self.assertLessEqual(max_error, 1)
 
 
 class SilenceTests(unittest.TestCase):
@@ -1109,7 +1548,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(

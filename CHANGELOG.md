@@ -1,3 +1,8 @@
+# v0.25.2
+- Add `AudioSegment.apply_gain_matrix()` (alias `remix()`) for explicit
+  output x input channel gain matrix mixing, with clip/normalize/raise peak
+  handling and support for 8, 16, 24 and 32 bit PCM
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 
