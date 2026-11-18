@@ -1,4 +1,7 @@
 # v0.25.1
+- Add `AudioSegment.automate_stereo_width()` (aliases: `automate_width()`,
+  `stereo_width_automation()`, `width_automation()`) to animate stereo width
+  with sample-accurate mid/side processing and linearly interpolated keyframes
 - Fix crashing bug in new scipy-powered EQ effects
 
 # v0.25.0

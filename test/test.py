@@ -1,4 +1,5 @@
 from functools import partial
+import array
 import os
 import sys
 import unittest
@@ -1093,6 +1094,296 @@ class AudioSegmentTests(unittest.TestCase):
 
         tempfile.tempdir = orig_tmpdir
         os.rmdir(new_tmpdir)
+
+
+class StereoWidthAutomationTests(unittest.TestCase):
+    """
+    Tests for AudioSegment.automate_stereo_width().
+
+    These use raw PCM constructed in memory so the channel math can be checked
+    sample by sample without relying on any encoder/decoder.
+    """
+
+    @staticmethod
+    def make_stereo(frames, frame_rate=1000, sample_width=2):
+        """Build a stereo segment from an iterable of (left, right) frames."""
+        array_type = {1: 'b', 2: 'h', 4: 'i'}[sample_width]
+        samples = array.array(array_type)
+        for left, right in frames:
+            samples.append(left)
+            samples.append(right)
+        try:
+            data = samples.tobytes()
+        except AttributeError:  # Python 2
+            data = samples.tostring()
+        return AudioSegment(data=data,
+                            sample_width=sample_width,
+                            frame_rate=frame_rate,
+                            channels=2)
+
+    def samples_of(self, seg):
+        """Return the segment's samples grouped into (left, right) frames."""
+        samples = seg.get_array_of_samples()
+        return [tuple(samples[i:i + 2]) for i in range(0, len(samples), 2)]
+
+    def test_original_width_is_identity(self):
+        frames = [(1000, 500), (-2000, 1234), (0, 0), (32767, -32768)]
+        seg = self.make_stereo(frames)
+        out = seg.automate_stereo_width([(0, 1.0)])
+
+        self.assertEqual(self.samples_of(out), frames)
+        self.assertEqual(out.channels, seg.channels)
+        self.assertEqual(out.frame_rate, seg.frame_rate)
+        self.assertEqual(out.sample_width, seg.sample_width)
+        self.assertEqual(len(out), len(seg))
+
+    def test_aliases_are_available(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        expected = seg.automate_stereo_width([(0, 0.0)]).raw_data
+        for name in ("stereo_width_automation", "automate_width",
+                     "width_automation"):
+            result = getattr(seg, name)([(0, 0.0)])
+            self.assertEqual(result.raw_data, expected)
+
+    def test_zero_width_is_mono_center(self):
+        frames = [(1000, 500), (-300, 100), (32767, -32768)]
+        seg = self.make_stereo(frames)
+        out = seg.automate_stereo_width([(0, 0.0)])
+
+        # the mid signal is (L + R) / 2, placed identically in both channels
+        expected = [(750, 750), (-100, -100), (-1, -1)]
+        self.assertEqual(self.samples_of(out), expected)
+        left, right = out.split_to_mono()
+        self.assertTrue(left == right)
+
+    def test_interpolation_is_linear_in_time(self):
+        # 10 ms of a constant (1000, 500) frame at 1 frame per ms.
+        seg = self.make_stereo([(1000, 500)] * 10)
+        # width 0 at 0ms -> width 1 at 9ms: middle of the segment is width 0.5
+        out = seg.automate_stereo_width([(0, 0.0), (9, 1.0)])
+
+        frames = self.samples_of(out)
+        # width 0 => (750, 750); width 1 => (1000, 500); width 0.5 => (875, 625)
+        self.assertEqual(frames[0], (750, 750))
+        self.assertEqual(frames[-1], (1000, 500))
+        # frame 4 is 4/9 of the way: mid 750 +/- (4/9 * 250) = 861.1 / 638.9
+        self.assertEqual(frames[4], (861, 639))
+        # monotonic widening of the side component
+        lefts = [frame[0] for frame in frames]
+        self.assertEqual(lefts, sorted(lefts))
+
+    def test_width_before_first_and_after_last_keyframe_is_held(self):
+        seg = self.make_stereo([(1000, 500)] * 10)
+        out = seg.automate_stereo_width([(2, 0.0), (7, 1.0)])
+
+        frames = self.samples_of(out)
+        # frames 0 and 1 are before the first keyframe -> width 0.0
+        self.assertEqual(frames[0], (750, 750))
+        self.assertEqual(frames[1], (750, 750))
+        # frames 7, 8 and 9 are at/after the last keyframe -> width 1.0
+        self.assertEqual(frames[7], (1000, 500))
+        self.assertEqual(frames[8], (1000, 500))
+        self.assertEqual(frames[9], (1000, 500))
+
+    def test_in_phase_material_never_changes(self):
+        frames = [(1000, 1000), (-500, -500), (0, 0)]
+        seg = self.make_stereo(frames)
+        # any width leaves in-phase material untouched, since side == 0
+        for width in (0.0, 0.25, 1.0, 2.0, 10.0):
+            out = seg.automate_stereo_width([(0, width)])
+            self.assertEqual(self.samples_of(out), frames)
+
+    def test_anti_phase_signal(self):
+        # A fully out-of-phase pair has mid == 0.
+        frames = [(1000, -1000), (-2000, 2000)]
+        seg = self.make_stereo(frames)
+
+        # Width 1.0 keeps the anti-phase signal as is.
+        self.assertEqual(self.samples_of(seg.automate_stereo_width([(0, 1.0)])),
+                         frames)
+
+        # Width 0.0 collapses the out-of-phase signal to silence.
+        self.assertEqual(self.samples_of(seg.automate_stereo_width([(0, 0.0)])),
+                         [(0, 0), (0, 0)])
+
+        # Width 0.5 halves the side signal.
+        self.assertEqual(self.samples_of(seg.automate_stereo_width([(0, 0.5)])),
+                         [(500, -500), (-1000, 1000)])
+
+    def test_impulse_channel_values_at_each_moment(self):
+        # A single-frame in-phase impulse at frame 0 and a single-frame
+        # anti-phase impulse at frame 3, with silence between them.
+        # This pins exact channel values at distinct times.
+        frames = [(1000, 1000), (0, 0), (0, 0), (1000, -1000), (0, 0)]
+        seg = self.make_stereo(frames)
+
+        out = seg.automate_stereo_width([(0, 0.0), (4, 1.0)])
+        values = self.samples_of(out)
+
+        # In-phase impulse is unaffected by width: mid stays 1000.
+        self.assertEqual(values[0], (1000, 1000))
+        # Silence stays silent.
+        self.assertEqual(values[1], (0, 0))
+        # Frame 3 has width 3/4. mid=0, side=1000 -> +/- 750.
+        self.assertEqual(values[3], (750, -750))
+        self.assertEqual(values[4], (0, 0))
+
+    def test_each_frame_matches_a_single_frame_segment(self):
+        # A segment processed as a whole must equal processing each frame on
+        # its own at that instant's interpolated width.
+        frames = [(1000, 500), (900, 400), (-250, 750), (-1000, -1000)]
+        seg = self.make_stereo(frames)
+        keyframes = [(0, 0.0), (3, 1.0)]
+        whole = self.samples_of(seg.automate_stereo_width(keyframes))
+
+        for index, frame in enumerate(frames):
+            single = self.make_stereo([frame])
+            width = index / 3.0
+            expected = self.samples_of(
+                single.automate_stereo_width([(0, width)]))[0]
+            self.assertEqual(whole[index], expected)
+
+    def test_widening_clips_to_sample_range(self):
+        # At full scale and out of phase, a width of 2 doubles the side signal
+        # far past full scale; it must saturate, not wrap around.
+        seg = self.make_stereo([(30000, -30000)])
+        out = seg.automate_stereo_width([(0, 2.0)])
+        self.assertEqual(self.samples_of(out), [(32767, -32768)])
+
+    def test_clipping_never_wraps_for_each_sample_width(self):
+        cases = [
+            (1, 100, -100, 127, -128),
+            (2, 30000, -30000, 32767, -32768),
+            (4, 2000000000, -2000000000, 2147483647, -2147483648),
+        ]
+        for sample_width, left, right, maxval, minval in cases:
+            seg = self.make_stereo([(left, right)], sample_width=sample_width)
+            out = seg.automate_stereo_width([(0, 3.0)])
+            positive, negative = self.samples_of(out)[0]
+            self.assertEqual(positive, maxval)
+            self.assertEqual(negative, minval)
+
+    def test_rounding_is_half_away_from_zero(self):
+        # width 0.5 of the side gives .5 sample increments, which must round
+        # consistently in both directions rather than using banker's rounding.
+        seg = self.make_stereo([(1001, 500), (-1001, -500)])
+        out = seg.automate_stereo_width([(0, 0.5)])
+        # mid=750.5 side=250.5 -> 750.5 +/- 125.25 = 875.75 / 625.25 -> 876/625
+        # mid=-750.5 side=-250.5 -> -750.5 +/- 125.25 = -875.75 / -625.25 -> -876/-625
+        self.assertEqual(self.samples_of(out), [(876, 625), (-876, -625)])
+
+    def test_supports_8_16_and_32_bit_audio(self):
+        for sample_width, left, right in [(1, 100, 50), (2, 1000, 500),
+                                          (4, 100000, 50000)]:
+            seg = self.make_stereo([(left, right)], sample_width=sample_width)
+            out = seg.automate_stereo_width([(0, 0.0)])
+            self.assertEqual(out.sample_width, sample_width)
+            self.assertEqual(out.channels, 2)
+            mid = (left + right) // 2
+            self.assertEqual(self.samples_of(out), [(mid, mid)])
+
+    def test_mono_input_is_returned_unchanged(self):
+        mono = Sine(440).to_audio_segment(duration=50)
+        out = mono.automate_stereo_width([(0, 0.0), (40, 1.0)])
+
+        self.assertEqual(out.channels, 1)
+        self.assertEqual(out.frame_rate, mono.frame_rate)
+        self.assertEqual(out.sample_width, mono.sample_width)
+        self.assertEqual(out.raw_data, mono.raw_data)
+
+    def test_rejects_more_than_two_channels(self):
+        samples = array.array('h', [1, 2, 3] * 4)
+        try:
+            data = samples.tobytes()
+        except AttributeError:  # Python 2
+            data = samples.tostring()
+        seg = AudioSegment(data=data, sample_width=2,
+                           frame_rate=1000, channels=3)
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([(0, 0.5)])
+
+    def test_out_of_order_keyframes_are_sorted(self):
+        seg = self.make_stereo([(1000, 500)] * 10)
+        ordered = seg.automate_stereo_width([(0, 0.0), (9, 1.0)])
+        shuffled = seg.automate_stereo_width([(9, 1.0), (0, 0.0)])
+        self.assertEqual(shuffled.raw_data, ordered.raw_data)
+
+    def test_duplicate_keyframes_are_collapsed(self):
+        seg = self.make_stereo([(1000, 500)] * 10)
+        plain = seg.automate_stereo_width([(0, 0.0), (9, 1.0)])
+        duplicated = seg.automate_stereo_width(
+            [(0, 0.0), (9, 1.0), (9, 1.0), (0, 0.0)])
+        self.assertEqual(duplicated.raw_data, plain.raw_data)
+
+    def test_conflicting_duplicate_keyframes_raise(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([(0, 0.0), (0, 1.0)])
+
+    def test_rejects_empty_keyframes(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([])
+
+    def test_rejects_negative_width(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([(0, -0.1)])
+
+    def test_rejects_non_finite_keyframe_values(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        for keyframes in (
+            [(0, float('nan'))],
+            [(0, float('inf'))],
+            [(float('nan'), 0.5)],
+            [(float('inf'), 0.5)],
+        ):
+            with self.assertRaises(ValueError):
+                seg.automate_stereo_width(keyframes)
+
+    def test_rejects_negative_time(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([(-1, 0.5)])
+
+    def test_rejects_malformed_keyframes(self):
+        seg = self.make_stereo([(1000, 500)] * 4)
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([(0,)])
+        with self.assertRaises(ValueError):
+            seg.automate_stereo_width([(0, 0.5, 1.0)])
+        with self.assertRaises(TypeError):
+            seg.automate_stereo_width([("0", 0.5)])
+        with self.assertRaises(TypeError):
+            seg.automate_stereo_width([(0, "0.5")])
+        with self.assertRaises(TypeError):
+            seg.automate_stereo_width("not a keyframe list")
+
+    def test_zero_length_segment(self):
+        seg = self.make_stereo([])
+        out = seg.automate_stereo_width([(0, 0.5)])
+        self.assertEqual(len(out), 0)
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(out.frame_rate, seg.frame_rate)
+
+    def test_keyframes_are_interpolated_per_sample_not_per_millisecond(self):
+        # At 48kHz a 1ms keyframe span covers 48 frames. A per-millisecond
+        # implementation would produce runs of 48 identical values; the width
+        # must instead change on (nearly) every sample.
+        frames = [(1000, 500)] * 4800  # 100ms at 48kHz
+        seg = self.make_stereo(frames, frame_rate=48000)
+        out = seg.automate_stereo_width([(0, 0.0), (10, 1.0)])
+
+        samples = out.get_array_of_samples()
+        # 5ms is frame 240; width 0.5 -> (875, 625)
+        self.assertEqual(tuple(samples[2 * 240:2 * 240 + 2]), (875, 625))
+
+        ramp = [samples[2 * i] for i in range(0, 241)]
+        # The ramp resolves far more levels than the 11 millisecond boundaries
+        # a per-millisecond implementation could produce.
+        self.assertGreater(len(set(ramp)), 50)
+        # And it is non-decreasing as the image opens up.
+        self.assertEqual(ramp, sorted(ramp))
 
 
 class SilenceTests(unittest.TestCase):

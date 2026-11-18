@@ -14,6 +14,7 @@ from .exceptions import TooManyMissingFrames, InvalidDuration
 
 if sys.version_info >= (3, 0):
     xrange = range
+    basestring = str
 
 
 @register_pydub_effect
@@ -335,7 +336,273 @@ def apply_gain_stereo(seg, left_gain=0.0, right_gain=0.0):
     right_data = audioop.tostereo(right_data, right.sample_width, 0, 1)
     
     output = audioop.add(left_data, right_data, seg.sample_width)
-    
+
     return seg._spawn(data=output,
                 overrides={'channels': 2,
                            'frame_width': 2 * seg.sample_width})
+
+
+def _round_half_away_from_zero(value):
+    """
+    Round to the nearest integer, with exact halves rounded away from zero.
+
+    Python's built-in ``round()`` uses banker's rounding (and returns a float
+    on Python 2), which would make the sample values depend on whether a
+    neighbour happened to be even.  Audio processing wants a predictable,
+    symmetric rule instead.
+    """
+    if value >= 0:
+        return int(math.floor(value + 0.5))
+    return int(math.ceil(value - 0.5))
+
+
+def _normalize_width_keyframes(keyframes):
+    """
+    Validate ``(millisecond, width)`` keyframes.
+
+    Returns a list of ``(time_ms, width)`` float pairs sorted by time, with
+    exact duplicates (same time and same width) collapsed.  Behaviour for the
+    awkward inputs is deliberate and documented in
+    :func:`automate_stereo_width`:
+
+    * out of order keyframes are sorted (a stable sort, so their relative
+      order at equal timestamps is preserved),
+    * equal timestamps with different widths are ambiguous and raise
+      ``ValueError``,
+    * times must be finite and non-negative,
+    * widths must be finite and non-negative (values above ``1.0`` are valid
+      and widen the image).
+    """
+    if isinstance(keyframes, (basestring, bytes, bytearray)):
+        raise TypeError(
+            "keyframes must be a sequence of (millisecond, width) pairs, "
+            "not %s" % type(keyframes).__name__)
+
+    try:
+        items = list(keyframes)
+    except TypeError:
+        raise TypeError(
+            "keyframes must be a sequence of (millisecond, width) pairs")
+
+    if not items:
+        raise ValueError(
+            "keyframes must contain at least one (millisecond, width) pair")
+
+    parsed = []
+    for index, keyframe in enumerate(items):
+        if isinstance(keyframe, (basestring, bytes, bytearray)):
+            raise TypeError(
+                "keyframe %d must be a (millisecond, width) pair, not %s" %
+                (index, type(keyframe).__name__))
+        try:
+            pair = list(keyframe)
+        except TypeError:
+            raise TypeError(
+                "keyframe %d must be a (millisecond, width) pair" % index)
+        if len(pair) != 2:
+            raise ValueError(
+                "keyframe %d must contain exactly (millisecond, width), "
+                "got %d value(s)" % (index, len(pair)))
+
+        raw_time, raw_width = pair
+        for label, value in (("millisecond", raw_time), ("width", raw_width)):
+            if isinstance(value, (basestring, bytes, bytearray)):
+                raise TypeError(
+                    "keyframe %d %s must be a number, not %s" %
+                    (index, label, type(value).__name__))
+
+        try:
+            time_ms = float(raw_time)
+        except (TypeError, ValueError):
+            raise TypeError(
+                "keyframe %d millisecond must be a number, not %s" %
+                (index, type(raw_time).__name__))
+        try:
+            width = float(raw_width)
+        except (TypeError, ValueError):
+            raise TypeError(
+                "keyframe %d width must be a number, not %s" %
+                (index, type(raw_width).__name__))
+
+        if math.isnan(time_ms) or math.isinf(time_ms):
+            raise ValueError(
+                "keyframe %d millisecond must be finite, got %r" %
+                (index, time_ms))
+        if time_ms < 0:
+            raise ValueError(
+                "keyframe %d millisecond must be non-negative, got %r" %
+                (index, time_ms))
+        if math.isnan(width) or math.isinf(width):
+            raise ValueError(
+                "keyframe %d width must be finite, got %r" %
+                (index, width))
+        if width < 0.0:
+            raise ValueError(
+                "keyframe %d width must be non-negative (0.0 is a mono "
+                "center signal, 1.0 keeps the original stereo image), "
+                "got %r" % (index, width))
+
+        parsed.append((time_ms, width))
+
+    # Accept keyframes in any order, but define the result unambiguously.
+    parsed.sort(key=lambda keyframe: keyframe[0])
+
+    normalized = []
+    for time_ms, width in parsed:
+        if normalized and normalized[-1][0] == time_ms:
+            if normalized[-1][1] != width:
+                raise ValueError(
+                    "conflicting widths for the same millisecond (%r): "
+                    "%r and %r" %
+                    (time_ms, normalized[-1][1], width))
+            continue
+        normalized.append((time_ms, width))
+
+    return normalized
+
+
+@register_pydub_effect
+def automate_stereo_width(seg, keyframes):
+    """
+    Automate the stereo width of a segment using mid/side processing.
+
+    ``keyframes`` is a sequence of ``(millisecond, width)`` pairs (times may
+    be ints or floats).  At every sample the width is linearly interpolated
+    between the surrounding keyframes; before the first keyframe the first
+    width is held, and after the last keyframe the last width is held.
+
+    The width scale is:
+
+    * ``0.0`` - the side signal is removed, leaving a mono signal centered in
+      both channels (the left and right channels both carry ``(L + R) / 2``),
+    * ``1.0`` - the original stereo image, unchanged,
+    * values between ``0.0`` and ``1.0`` are a linear blend of the two,
+    * values above ``1.0`` widen the image further by boosting the side
+      signal (this is where clipping can occur, see below).
+
+    This is the standard mid/side decomposition ``M = (L + R) / 2`` and
+    ``S = (L - R) / 2`` with the mid gain held at unity and the side gain set
+    to the width: ``L' = M + width * S`` and ``R' = M - width * S``.  Because
+    the mid is untouched, width ``1.0`` reproduces the input exactly and
+    in-phase material is never altered.
+
+    The returned segment has the same channel count, frame rate, sample width
+    and duration as the input.  Gains are rounded half away from zero.  For
+    widths in ``[0.0, 1.0]`` the output is a convex blend of the left and right
+    samples, so it can never leave the sample width's integer range.  Widths
+    above ``1.0`` can push the boosted side signal past full scale; those
+    samples are clipped (saturated) to the available range and never wrap
+    around.
+
+    Mono input has no side component, so it is returned as an identical copy
+    (still mono) rather than being silently upmixed.  Segments with more than
+    two channels raise ``ValueError``, since mid/side width is only defined
+    for stereo.
+
+    Keyframe validation:
+
+    * out of order keyframes are sorted before use,
+    * exact duplicate keyframes are collapsed, while two different widths at
+      the same millisecond raise ``ValueError``,
+    * negative or non-finite times and non-finite widths raise ``ValueError``,
+    * negative widths raise ``ValueError`` (widths above ``1.0`` are allowed
+      and widen the image, clipping if necessary),
+    * an empty keyframe list raises ``ValueError``,
+    * malformed keyframes (not a pair, non-numeric) raise ``TypeError`` or
+      ``ValueError`` with the offending index in the message.
+
+    Example::
+
+        # start as a normal stereo image, collapse to mono by 1s, then
+        # open back up to the original width by 3s
+        widened = sound.stereo_width_automation([
+            (0, 1.0),
+            (1000, 0.0),
+            (3000, 1.0),
+        ])
+    """
+    keyframes = _normalize_width_keyframes(keyframes)
+
+    if seg.channels == 1:
+        # No side signal exists; the automation cannot have an audible effect.
+        return seg._spawn(data=seg._data)
+
+    if seg.channels != 2:
+        raise ValueError(
+            "automate_stereo_width only supports mono or stereo audio, "
+            "this segment has %d channels" % seg.channels)
+
+    samples = seg.get_array_of_samples()
+    frame_count = len(samples) // 2
+
+    if frame_count == 0:
+        return seg._spawn(data=seg._data)
+
+    minval, maxval = get_min_max_value(seg.sample_width * 8)
+    frame_rate = float(seg.frame_rate)
+
+    times = [keyframe[0] for keyframe in keyframes]
+    widths = [keyframe[1] for keyframe in keyframes]
+    last_keyframe = len(keyframes) - 1
+
+    output = array.array(seg.array_type)
+    append = output.append
+
+    next_keyframe = 0
+    for frame_index in xrange(frame_count):
+        time_ms = frame_index * 1000.0 / frame_rate
+
+        # advance to the pair of keyframes that surrounds this sample
+        while next_keyframe < last_keyframe and time_ms >= times[next_keyframe + 1]:
+            next_keyframe += 1
+
+        if time_ms <= times[0]:
+            width = widths[0]
+        elif time_ms >= times[-1]:
+            width = widths[-1]
+        else:
+            start_time = times[next_keyframe]
+            end_time = times[next_keyframe + 1]
+            fraction = (time_ms - start_time) / (end_time - start_time)
+            width = widths[next_keyframe] + \
+                (widths[next_keyframe + 1] - widths[next_keyframe]) * fraction
+
+        left = samples[frame_index * 2]
+        right = samples[frame_index * 2 + 1]
+
+        mid = (left + right) * 0.5
+        side = (left - right) * 0.5
+
+        left_value = mid + width * side
+        right_value = mid - width * side
+
+        # Clamp as floats before rounding: a very large (but finite) width can
+        # produce a value beyond float integer precision, and int(inf/nan)
+        # would fail. Clamping first also keeps the rounding step harmless.
+        if left_value < minval:
+            out_left = minval
+        elif left_value > maxval:
+            out_left = maxval
+        else:
+            out_left = _round_half_away_from_zero(left_value)
+        if right_value < minval:
+            out_right = minval
+        elif right_value > maxval:
+            out_right = maxval
+        else:
+            out_right = _round_half_away_from_zero(right_value)
+
+        append(out_left)
+        append(out_right)
+
+    return seg._spawn(data=output)
+
+
+# Convenience spellings for the same effect.  ``automate_stereo_width`` is the
+# canonical name; the aliases make the intent discoverable from either the
+# "automation" or the "width" side of the API.
+stereo_width_automation = register_pydub_effect(
+    automate_stereo_width, "stereo_width_automation")
+automate_width = register_pydub_effect(automate_stereo_width, "automate_width")
+width_automation = register_pydub_effect(automate_stereo_width,
+                                         "width_automation")

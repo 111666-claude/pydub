@@ -520,6 +520,60 @@ is decreasing on one side, the other side needs to get louder to
 compensate. When panned hard left, the left channel will be 3dB louder and
 the right channel will be silent (and vice versa).
 
+### AudioSegment(…).automate_stereo_width()
+
+Animate the stereo width of a segment over time, for example to open a
+recording up as the camera pushes in. Takes a sequence of
+`(millisecond, width)` keyframes, sorted or unsorted:
+
+```python
+from pydub import AudioSegment
+sound1 = AudioSegment.from_file("ambience.wav")
+
+# start narrow, open to full width by 4s, then tighten slightly
+widened = sound1.automate_stereo_width([
+    (0, 0.2),
+    (4000, 1.0),
+    (8000, 0.8),
+])
+```
+
+The width is linearly interpolated between keyframes at every *sample*
+(not every millisecond), so at 48kHz a 1ms keyframe span still produces a
+smooth ramp. Before the first keyframe the first width is held, and after
+the last keyframe the last width is held.
+
+The width scale is the standard mid/side decomposition: with
+`M = (L + R) / 2` and `S = (L - R) / 2`, the output is `M + width * S` on
+the left and `M - width * S` on the right.
+
+- `0.0` removes the side signal, producing a mono (centre) signal in both
+  channels. Out-of-phase material collapses to silence.
+- `1.0` reproduces the input exactly. In-phase material is never changed at
+  any width, because it has no side component.
+- Values between `0.0` and `1.0` narrow the image; values above `1.0`
+  widen it further.
+
+The returned segment keeps the input's channel count, frame rate, sample
+width and duration. Short mono segments have no side signal and are returned
+unchanged; segments with more than two channels raise `ValueError`.
+
+Gains are rounded half away from zero. Samples that leave the sample width's
+integer range are clipped (saturated) rather than wrapped around, which can
+happen when using widths above `1.0`.
+
+**Supported keyword arguments**:
+
+- `keyframes` | example: `[(0, 1.0), (3000, 0.0)]` | NO DEFAULT
+  A non-empty sequence of `(millisecond, width)` pairs. Milliseconds must be
+  finite and non-negative; widths must be finite and non-negative. Out of
+  order keyframes are sorted and exact duplicates collapsed, while two
+  different widths at the same millisecond raise `ValueError`. Malformed
+  pairs raise `TypeError`/`ValueError` naming the offending index.
+
+`automate_width()`, `stereo_width_automation()` and `width_automation()` are
+provided as equivalent spellings.
+
 ### AudioSegment(…).get_array_of_samples()
 
 Returns the raw audio data as an array of (numeric) samples. Note: if the audio has multiple channels, the samples for each channel will be serialized – for example, stereo audio would look like `[sample_1_L, sample_1_R, sample_2_L, sample_2_R, …]`.
