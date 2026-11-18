@@ -1113,6 +1113,90 @@ class AudioSegment(object):
     def duration_seconds(self):
         return self.frame_rate and self.frame_count() / self.frame_rate or 0.0
 
+    def detect_transients(self, window_ms=10, sensitivity=1.5, min_interval_ms=50):
+        """
+        Detect transient onsets (e.g. percussive hits) and return their
+        rising-edge times in milliseconds, relative to the start of this
+        AudioSegment. The audio data is not modified.
+
+        window_ms: length of the analysis window in milliseconds (> 0).
+        sensitivity: how far a window's energy must rise above the local
+            noise-floor estimate to count as an onset, as a ratio (>= 1.0).
+            Higher values detect only sharper/louder transients.
+        min_interval_ms: refractory period in milliseconds (>= 0). Onsets
+            occurring sooner than this after a detected onset are
+            suppressed, so the decaying tail of one hit does not
+            retrigger detection.
+
+        Returns a sorted list of onset times in milliseconds (floats).
+        Silence, constant-level audio (however loud), and segments shorter
+        than two analysis windows yield an empty list.
+        """
+        if window_ms <= 0:
+            raise ValueError("window_ms must be greater than 0")
+        if sensitivity < 1.0:
+            raise ValueError("sensitivity must be >= 1.0")
+        if min_interval_ms < 0:
+            raise ValueError("min_interval_ms must be >= 0")
+
+        window_frames = int(round(self.frame_rate * window_ms / 1000.0))
+        if window_frames < 1:
+            window_frames = 1
+        window_duration_ms = window_frames * 1000.0 / self.frame_rate
+
+        window_count = int(self.frame_count()) // window_frames
+        # at least two windows are needed to establish a rising edge
+        if window_count < 2:
+            return []
+
+        sample_width = self.sample_width
+        window_bytes = window_frames * self.frame_width
+        max_amplitude = float(self.max_possible_amplitude)
+        channels = self.channels
+
+        # Per-window energy, summed over channels and normalized by the
+        # maximum possible amplitude, so results are independent of bit
+        # depth and sample rate.
+        energies = []
+        data = self._data
+        for i in range(window_count):
+            chunk = data[i * window_bytes:(i + 1) * window_bytes]
+            rms = audioop.rms(chunk, sample_width) / max_amplitude
+            energies.append(channels * rms * rms)
+
+        # Absolute gate at -60 dBFS per channel so that digital silence
+        # (and sub-audible noise) can never trigger, regardless of the
+        # relative noise-floor estimate.
+        absolute_floor = channels * 1e-6
+
+        # Local noise floor: median energy of the surrounding +/-250ms.
+        # The median is robust to the transient itself falling inside the
+        # neighborhood.
+        floor_radius = max(2, int(round(250.0 / window_duration_ms)))
+
+        onsets = []
+        last_onset_ms = None
+        for i in range(1, window_count):
+            lo = max(0, i - floor_radius)
+            hi = min(window_count, i + floor_radius + 1)
+            neighborhood = sorted(energies[lo:hi])
+            floor = neighborhood[len(neighborhood) // 2]
+            threshold = max(sensitivity * floor, absolute_floor)
+
+            # rising edge only: the previous window must be below threshold
+            if energies[i] <= threshold or energies[i - 1] > threshold:
+                continue
+
+            onset_ms = i * window_duration_ms
+            if (last_onset_ms is not None and
+                    onset_ms - last_onset_ms < min_interval_ms):
+                continue
+
+            onsets.append(round(onset_ms, 3))
+            last_onset_ms = onset_ms
+
+        return onsets
+
     def get_dc_offset(self, channel=1):
         """
         Returns a value between -1.0 and 1.0 representing the DC offset of a

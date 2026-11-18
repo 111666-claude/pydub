@@ -303,6 +303,28 @@ sound = AudioSegment.from_file("sound1.wav")
 assert sound.duration_seconds == (len(sound) / 1000.0)
 ```
 
+### AudioSegment(…).detect_transients()
+
+Detects transient onsets (e.g. percussive hits) and returns their rising-edge times in milliseconds, relative to the start of the `AudioSegment`, as a sorted list of floats. The audio is not modified. Useful for automatically finding slice points in recordings of drums or other impulsive sounds.
+
+Each analysis window's energy (summed over channels, normalized so results are independent of sample rate and bit depth) is compared against a local noise-floor estimate — the median energy of the surrounding ~500ms. An onset is reported where the energy rises above `sensitivity` times that floor, and onsets closer than `min_interval_ms` to a previously reported onset are suppressed so the decaying tail of one hit does not retrigger detection.
+
+Silence, constant-level audio (however loud), and segments shorter than two analysis windows yield an empty list. Times are relative to the start of the segment, so slicing a segment first gives times relative to the slice.
+
+**Supported keyword arguments**:
+
+- `window_ms` — analysis window length in milliseconds (default 10, must be > 0)
+- `sensitivity` — required ratio of window energy to the local noise floor (default 1.5, must be >= 1.0); higher values detect only sharper/louder transients
+- `min_interval_ms` — refractory period in milliseconds (default 50, must be >= 0)
+
+```python
+from pydub import AudioSegment
+drums = AudioSegment.from_file("drums.wav")
+
+onsets = drums.detect_transients(window_ms=10, sensitivity=1.5, min_interval_ms=50)
+slices = [drums[start:] for start in onsets]
+```
+
 ### AudioSegment(…).raw_data
 
 The raw audio data of the AudioSegment. Useful for interacting with other audio libraries or weird APIs that want audio data in the form of a bytestring. Also comes in handy if you’re implementing effects or other direct signal processing.

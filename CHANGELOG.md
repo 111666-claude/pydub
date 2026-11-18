@@ -1,3 +1,6 @@
+# Unreleased
+- Add `pydub.AudioSegment.detect_transients()` for locating transient onsets (e.g. percussive hits) as slice points, with configurable window length, sensitivity, and minimum interval
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

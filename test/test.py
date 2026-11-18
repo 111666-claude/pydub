@@ -1154,6 +1154,127 @@ class SilenceTests(unittest.TestCase):
             prev_end = end
 
 
+class TransientDetectionTests(unittest.TestCase):
+
+    def _segment_with_hits(self, hit_times_ms, duration_ms=1000, hit_ms=20,
+                           frame_rate=44100, sample_width=2, channels=1,
+                           hit_gain=-6.0):
+        seg = AudioSegment.silent(duration=duration_ms, frame_rate=frame_rate)
+        seg = seg.set_sample_width(sample_width).set_channels(channels)
+        hit = Sine(880).to_audio_segment(duration=hit_ms).apply_gain(hit_gain)
+        hit = hit.set_frame_rate(frame_rate)
+        hit = hit.set_sample_width(sample_width).set_channels(channels)
+        for t in hit_times_ms:
+            seg = seg.overlay(hit, position=t)
+        return seg
+
+    def test_detects_deterministic_impulses(self):
+        hit_times = [100, 400, 700]
+        seg = self._segment_with_hits(hit_times)
+        onsets = seg.detect_transients(window_ms=10)
+        self.assertEqual(len(onsets), len(hit_times))
+        for onset, expected in zip(onsets, hit_times):
+            # onset is reported at the start of the window containing it
+            self.assertLessEqual(abs(onset - expected), 10)
+
+    def test_does_not_modify_audio(self):
+        seg = self._segment_with_hits([100, 400, 700])
+        data_before = seg._data
+        len_before = len(seg)
+        seg.detect_transients()
+        self.assertEqual(seg._data, data_before)
+        self.assertEqual(len(seg), len_before)
+
+    def test_returns_floats_in_ascending_order(self):
+        seg = self._segment_with_hits([100, 400, 700])
+        onsets = seg.detect_transients()
+        self.assertTrue(all(isinstance(t, float) for t in onsets))
+        self.assertEqual(onsets, sorted(onsets))
+
+    def test_complete_silence_returns_empty(self):
+        seg = AudioSegment.silent(duration=2000, frame_rate=44100)
+        self.assertEqual(seg.detect_transients(), [])
+
+    def test_sustained_loud_audio_returns_empty(self):
+        seg = Sine(440).to_audio_segment(duration=2000).apply_gain(-3)
+        self.assertEqual(seg.detect_transients(), [])
+
+    def test_crescendo_returns_empty(self):
+        # a gradual fade-in has no sharp rising edge above the local floor
+        seg = Sine(440).to_audio_segment(duration=2000).apply_gain(-6)
+        seg = seg.fade(from_gain=-120, start=0, duration=2000)
+        self.assertEqual(seg.detect_transients(), [])
+
+    def test_constant_white_noise_returns_empty(self):
+        seg = WhiteNoise().to_audio_segment(duration=2000).apply_gain(-12)
+        self.assertEqual(seg.detect_transients(), [])
+
+    def test_very_short_segment_returns_empty(self):
+        seg = self._segment_with_hits([0], duration_ms=5)
+        self.assertEqual(seg.detect_transients(window_ms=10), [])
+
+    def test_invalid_parameters_raise(self):
+        seg = AudioSegment.silent(duration=1000, frame_rate=44100)
+        self.assertRaises(ValueError, seg.detect_transients, window_ms=0)
+        self.assertRaises(ValueError, seg.detect_transients, window_ms=-5)
+        self.assertRaises(ValueError, seg.detect_transients, sensitivity=0.5)
+        self.assertRaises(ValueError, seg.detect_transients, min_interval_ms=-1)
+
+    def test_min_interval_suppresses_close_onsets(self):
+        seg = self._segment_with_hits([100, 130])
+        onsets = seg.detect_transients(window_ms=10, min_interval_ms=50)
+        self.assertEqual(len(onsets), 1)
+        self.assertLessEqual(abs(onsets[0] - 100), 10)
+        onsets = seg.detect_transients(window_ms=10, min_interval_ms=10)
+        self.assertEqual(len(onsets), 2)
+
+    def test_hit_tail_does_not_retrigger(self):
+        # one hit followed by its own decaying echoes: a single onset
+        seg = AudioSegment.silent(duration=1000, frame_rate=44100)
+        hit = Sine(880).to_audio_segment(duration=20).apply_gain(-6)
+        for position, gain in ((100, 0), (150, -10), (200, -20)):
+            seg = seg.overlay(hit.apply_gain(gain), position=position)
+        onsets = seg.detect_transients(window_ms=10, min_interval_ms=120)
+        self.assertEqual(len(onsets), 1)
+        self.assertLessEqual(abs(onsets[0] - 100), 10)
+
+    def test_consistent_across_sample_rates(self):
+        hit_times = [200, 600]
+        onsets_by_rate = []
+        for frame_rate in (44100, 22050, 8000):
+            seg = self._segment_with_hits(hit_times, frame_rate=frame_rate)
+            onsets_by_rate.append(seg.detect_transients(window_ms=10))
+        for onsets in onsets_by_rate:
+            self.assertEqual(len(onsets), len(hit_times))
+            for onset, expected in zip(onsets, hit_times):
+                self.assertLessEqual(abs(onset - expected), 15)
+
+    def test_consistent_across_bit_depths(self):
+        hit_times = [200, 600]
+        onsets_by_width = []
+        for sample_width in (1, 2, 4):
+            seg = self._segment_with_hits(hit_times, sample_width=sample_width)
+            onsets_by_width.append(seg.detect_transients(window_ms=10))
+        for onsets in onsets_by_width:
+            self.assertEqual(len(onsets), len(hit_times))
+            for onset, expected in zip(onsets, hit_times):
+                self.assertLessEqual(abs(onset - expected), 10)
+
+    def test_multichannel(self):
+        seg = self._segment_with_hits([300], channels=2)
+        onsets = seg.detect_transients(window_ms=10)
+        self.assertEqual(len(onsets), 1)
+        self.assertLessEqual(abs(onsets[0] - 300), 10)
+
+    def test_cropped_segment_time_base_is_relative(self):
+        seg = self._segment_with_hits([200, 600])
+        cropped = seg[400:]
+        onsets = cropped.detect_transients(window_ms=10)
+        self.assertEqual(len(onsets), 1)
+        # the 600ms hit is now 200ms after the crop point
+        self.assertLessEqual(abs(onsets[0] - 200), 10)
+
+
 class GeneratorTests(unittest.TestCase):
 
     def test_with_smoke(self):
