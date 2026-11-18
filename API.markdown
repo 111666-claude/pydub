@@ -612,6 +612,36 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).feedback_delay()
+
+Add a feedback delay (echo) effect. Each echo is a copy of the previous one scaled by `feedback`, so the repeats decay exponentially — e.g. `feedback=0.4` gives footsteps three or four recognizable, weakening echoes. Returns a new `AudioSegment`; the source is not modified. The channel count, frame rate and sample width are preserved.
+
+```python
+from pydub import AudioSegment
+
+footsteps = AudioSegment.from_file("footsteps.wav")
+echoing = footsteps.feedback_delay(delay_ms=250, feedback=0.4, wet=0.5)
+```
+
+**Supported keyword arguments**:
+
+- `delay_ms` | example: `250` | default: 250
+  Delay between the original signal and the first echo, in milliseconds. Converted to a whole number of samples (frames) with half-up rounding rather than slicing whole milliseconds, so echo timing is sample-accurate. Must be `>= 0`; a zero delay applies the dry gain only and adds no tail.
+
+- `feedback` | example: `0.4` | default: 0.4
+  Linear amount of the delayed signal fed back into the delay line. Must be in the range `[0.0, 1.0)`. `0.0` produces a single echo; values near `1.0` produce many slowly decaying repeats. Values `< 0` or `>= 1.0` raise a `ValueError`.
+
+- `wet` | example: `0.5` | default: 0.5
+  Linear amplitude factor for the echoed (wet) signal. Must be `>= 0.0`.
+
+- `dry` | example: `1.0` | default: 1.0
+  Linear amplitude factor for the original (dry) signal. Must be `>= 0.0`; set it to `0.0` to keep only the echoes.
+
+- `max_tail_ms` | example: `5000` | default: 5000
+  Maximum amount of echo tail appended after the end of the segment, in milliseconds. Echoes that would fall beyond the segment plus this tail are dropped. Must be `>= 0`.
+
+Samples are computed in the segment's integer sample domain and hard clipped (saturated) to the range of its sample width when a dry signal and an echo overlap. An empty segment is returned unchanged as an empty segment.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

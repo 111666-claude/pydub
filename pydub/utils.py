@@ -14,7 +14,9 @@ from functools import wraps
 try:
     import audioop
 except ImportError:
-    import pyaudioop as audioop
+    # the stdlib audioop module was removed in Python 3.13; pydub ships a
+    # drop-in replacement that must be imported as a relative module
+    from . import pyaudioop as audioop
 
 if sys.version_info >= (3, 0):
     basestring = str

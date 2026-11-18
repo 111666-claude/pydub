@@ -335,7 +335,139 @@ def apply_gain_stereo(seg, left_gain=0.0, right_gain=0.0):
     right_data = audioop.tostereo(right_data, right.sample_width, 0, 1)
     
     output = audioop.add(left_data, right_data, seg.sample_width)
-    
+
     return seg._spawn(data=output,
                 overrides={'channels': 2,
                            'frame_width': 2 * seg.sample_width})
+
+
+@register_pydub_effect
+def feedback_delay(seg, delay_ms=250, feedback=0.4, wet=0.5, dry=1.0,
+                   max_tail_ms=5000):
+    """
+    Add a feedback delay (echo) effect to an AudioSegment.
+
+    The effect is a classic feedback delay line: each echo is a copy of the
+    previous echo, scaled by ``feedback``. For a sample at frame n the output
+    is::
+
+        out[n] = dry * in[n] + wet * delay_line[n]
+        delay_line[n] = in[n] + feedback * delay_line[n - delay_frames]
+
+    so a sample at frame n reappears as the k-th echo at frame
+    n + k * delay_frames with an amplitude of wet * feedback**(k - 1)
+    (as long as no clipping occurs).
+
+    Keyword Arguments:
+
+        delay_ms - default: 250
+            Delay between the original signal and the first echo, in
+            milliseconds. It is converted to a whole number of *samples
+            (frames)* with half-up rounding (``int(ms * frame_rate / 1000
+            + 0.5)``) rather than by slicing whole milliseconds, so echo
+            timing is sample-accurate. Must be >= 0. With a zero delay no
+            delay line is possible, so the segment is returned with only the
+            dry gain applied and no tail.
+
+        feedback - default: 0.4
+            Amount of the delayed signal fed back into the delay line, a
+            linear amplitude factor in the range [0.0, 1.0). Values < 0 or
+            >= 1.0 raise a ValueError: feedback >= 1 would make the echoes
+            grow or never decay, so a finite tail could not represent the
+            result. 0.0 produces a single echo with no repeats.
+
+        wet - default: 0.5
+            Linear amplitude factor applied to the echoed (wet) signal. Must
+            be >= 0.0.
+
+        dry - default: 1.0
+            Linear amplitude factor applied to the original (dry) signal.
+            Must be >= 0.0. Set to 0.0 to keep only the echoes.
+
+        max_tail_ms - default: 5000
+            Maximum amount of silence/echoes appended after the end of the
+            original segment, in milliseconds. Converted to frames with the
+            same half-up rounding as ``delay_ms``. Echoes that would fall
+            beyond the original segment plus this tail are dropped, not
+            wrapped or truncated mid-echo processing; the output is simply
+            cut to that length. Must be >= 0.
+
+    Returns a new AudioSegment. The number of channels, frame rate and
+    sample width (and therefore the sample format) are preserved; the source
+    segment is never modified.
+
+    Clipping rule: all arithmetic is done in the segment's integer sample
+    domain. Every sample written to the delay line or to the output is hard
+    clipped (saturated) to the range of the sample width, the same rule used
+    by ``audioop.add``/``audioop.mul`` (e.g. -32768..32767 for 16-bit audio).
+
+    An empty (zero-frame) segment returns an empty segment of the same
+    format, regardless of the tail setting.
+    """
+    if delay_ms < 0:
+        raise ValueError("delay_ms must be greater than or equal to 0")
+    if not 0.0 <= feedback < 1.0:
+        raise ValueError("feedback must be in the range [0.0, 1.0)")
+    if wet < 0:
+        raise ValueError("wet must be greater than or equal to 0.0")
+    if dry < 0:
+        raise ValueError("dry must be greater than or equal to 0.0")
+    if max_tail_ms < 0:
+        raise ValueError("max_tail_ms must be greater than or equal to 0")
+
+    in_frames = int(seg.frame_count())
+
+    # an empty segment has nothing to echo; keep its (arbitrary) format
+    if in_frames == 0:
+        return seg._spawn(seg._data)
+
+    # half-up rounding gives sample-accurate, non-negative frame counts
+    delay_frames = int(delay_ms * seg.frame_rate / 1000.0 + 0.5)
+    tail_frames = int(max_tail_ms * seg.frame_rate / 1000.0 + 0.5)
+
+    # zero delay cannot recurse; apply the dry gain only, with no tail
+    if delay_frames == 0:
+        if dry == 1.0:
+            return seg._spawn(seg._data)
+        min_sample, max_sample = get_min_max_value(seg.sample_width * 8)
+        scaled = seg.get_array_of_samples()
+        for i, sample in enumerate(scaled):
+            val = int(sample * dry)
+            scaled[i] = min(max(val, min_sample), max_sample)
+        return seg._spawn(scaled)
+
+    min_sample, max_sample = get_min_max_value(seg.sample_width * 8)
+
+    def clip(sample):
+        if sample > max_sample:
+            return max_sample
+        if sample < min_sample:
+            return min_sample
+        return sample
+
+    n_channels = seg.channels
+    input_samples = seg.get_array_of_samples()
+    total_frames = in_frames + tail_frames
+    total_samples = total_frames * n_channels
+    delay_samples = delay_frames * n_channels
+
+    # the delay line holds the (clipped) recirculated signal; the output
+    # holds the dry/wet mix. Both start silent.
+    silent_template = array.array(seg.array_type, [0])
+    delay_line = silent_template * total_samples
+    output = array.array(seg.array_type, [0]) * total_samples
+
+    input_sample_count = in_frames * n_channels
+    for i in xrange(total_samples):
+        in_sample = input_samples[i] if i < input_sample_count else 0
+
+        if i >= delay_samples:
+            delayed = delay_line[i - delay_samples]
+        else:
+            delayed = 0
+
+        # clip first so the values fed back are exactly the stored ones
+        delay_line[i] = clip(in_sample + int(feedback * delayed))
+        output[i] = clip(int(dry * in_sample) + int(wet * delayed))
+
+    return seg._spawn(output)

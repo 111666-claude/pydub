@@ -1,4 +1,5 @@
 from functools import partial
+import array
 import os
 import sys
 import unittest
@@ -1086,7 +1087,7 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
@@ -1109,7 +1110,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(
@@ -1329,6 +1330,177 @@ class FilterTests(unittest.TestCase):
         s = Sine(100).to_audio_segment()
         less_treble = s.low_pass_filter(800)
         self.assertAlmostEqual(less_treble.dBFS, s.dBFS, places=0)
+
+
+class FeedbackDelayTests(unittest.TestCase):
+    frame_rate = 1000  # 1ms per frame, so echo positions are easy to reason about
+
+    def segment(self, samples, channels=1, sample_width=2):
+        template = AudioSegment(b"", metadata={
+            "channels": channels,
+            "sample_width": sample_width,
+            "frame_rate": self.frame_rate,
+            "frame_width": channels * sample_width,
+        })
+        data = array.array(template.array_type, samples)
+        return AudioSegment(
+            data,
+            channels=channels,
+            sample_width=sample_width,
+            frame_rate=self.frame_rate,
+        )
+
+    def pulse(self, amplitude=1000, length=500, channels=1, sample_width=2):
+        frame = [amplitude] * channels
+        return self.segment(
+            frame + [0] * channels * (length - 1),
+            channels=channels,
+            sample_width=sample_width,
+        )
+
+    def test_single_pulse_echo_positions_and_decay(self):
+        seg = self.pulse()
+        out = seg.feedback_delay(
+            delay_ms=100, feedback=0.5, wet=0.5, dry=1.0, max_tail_ms=400)
+
+        self.assertEqual(out.frame_count(), 900)  # 500 original + 400 tail
+        samples = out.get_array_of_samples()
+        nonzero = [(i, v) for i, v in enumerate(samples) if v != 0]
+
+        # echo k is at frame 100*k; the wet echo amplitude (k >= 1) is
+        # wet * feedback**(k-1) * 1000 since the first echo has no feedback
+        expected = [(0, 1000)] + [
+            (k * 100, int(0.5 * (0.5 ** (k - 1)) * 1000))
+            for k in range(1, 9)
+        ]
+        self.assertEqual(nonzero, expected)
+
+    def test_echoes_are_sample_accurate_not_ms_sliced(self):
+        # 1.5ms at 1000Hz is not a whole number of frames: half-up -> 2 frames
+        seg = self.pulse(length=10)
+        out = seg.feedback_delay(
+            delay_ms=1.5, feedback=0.0, wet=1.0, dry=0.0, max_tail_ms=10)
+        positions = [i for i, v in enumerate(out.get_array_of_samples())
+                     if v != 0]
+        self.assertEqual(positions, [2])
+
+        # a sub-millisecond delay rounds to a single frame
+        out2 = seg.feedback_delay(
+            delay_ms=0.6, feedback=0.0, wet=1.0, dry=0.0, max_tail_ms=10)
+        positions2 = [i for i, v in enumerate(out2.get_array_of_samples())
+                      if v != 0]
+        self.assertEqual(positions2, [1])
+
+    def test_source_segment_is_not_modified(self):
+        seg = self.pulse()
+        before = seg.raw_data
+        seg.feedback_delay(delay_ms=100, feedback=0.5, max_tail_ms=400)
+        self.assertEqual(seg.raw_data, before)
+        self.assertEqual(len(seg), 500)
+
+    def test_stereo_left_and_right_pulses_are_kept_separate(self):
+        seg = self.segment([1000, 2000] + [0, 0] * 499, channels=2)
+        out = seg.feedback_delay(
+            delay_ms=100, feedback=0.5, wet=0.5, dry=1.0, max_tail_ms=200)
+
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(out.sample_width, 2)
+        samples = out.get_array_of_samples()
+
+        self.assertEqual((samples[0], samples[1]), (1000, 2000))
+        self.assertEqual((samples[200], samples[201]), (500, 1000))
+        self.assertEqual((samples[400], samples[401]), (250, 500))
+        self.assertEqual((samples[600], samples[601]), (125, 250))
+
+    def test_format_is_preserved_for_every_sample_width(self):
+        for sample_width in (1, 2, 4):
+            seg = self.pulse(amplitude=50, sample_width=sample_width)
+            out = seg.feedback_delay(
+                delay_ms=10, feedback=0.3, max_tail_ms=50)
+            self.assertEqual(out.sample_width, sample_width)
+            self.assertEqual(out.channels, 1)
+            self.assertEqual(out.frame_rate, self.frame_rate)
+
+    def test_zero_delay_applies_dry_gain_only_and_adds_no_tail(self):
+        seg = self.pulse()
+        out = seg.feedback_delay(
+            delay_ms=0, feedback=0.5, wet=0.5, dry=0.7, max_tail_ms=400)
+
+        self.assertEqual(out.frame_count(), seg.frame_count())
+        samples = out.get_array_of_samples()
+        self.assertEqual(samples[0], int(1000 * 0.7))
+        self.assertTrue(all(v == 0 for v in samples[1:]))
+
+        # dry == 1.0 on zero delay returns identical data
+        identity = seg.feedback_delay(delay_ms=0)
+        self.assertEqual(identity.raw_data, seg.raw_data)
+
+    def test_empty_segment_returns_empty_segment(self):
+        empty = AudioSegment.empty()
+        out = empty.feedback_delay(delay_ms=100, max_tail_ms=1000)
+        self.assertEqual(len(out), 0)
+        self.assertEqual(out.sample_width, empty.sample_width)
+        self.assertEqual(out.channels, empty.channels)
+
+    def test_feedback_zero_gives_a_single_echo(self):
+        seg = self.pulse(length=50)
+        out = seg.feedback_delay(
+            delay_ms=5, feedback=0.0, wet=0.8, dry=1.0, max_tail_ms=20)
+        nonzero = [(i, v) for i, v in enumerate(out.get_array_of_samples())
+                   if v != 0]
+        self.assertEqual(nonzero, [(0, 1000), (5, 800)])
+
+    def test_feedback_near_one_decays_and_respects_tail(self):
+        seg = self.pulse()
+        out = seg.feedback_delay(
+            delay_ms=50, feedback=0.99, wet=0.5, max_tail_ms=300)
+
+        self.assertEqual(out.frame_count(), 800)  # tail caps the length
+        samples = out.get_array_of_samples()
+        amplitudes = [abs(samples[i]) for i in range(50, 800, 50)]
+        # every echo is present, and feedback < 1 means they never grow
+        self.assertTrue(all(a > 0 for a in amplitudes))
+        self.assertTrue(all(amplitudes[i] >= amplitudes[i + 1]
+                            for i in range(len(amplitudes) - 1)))
+
+    def test_max_tail_zero_keeps_original_length_and_drops_later_echoes(self):
+        seg = self.pulse(length=50)
+        out = seg.feedback_delay(
+            delay_ms=20, feedback=0.5, wet=0.5, max_tail_ms=0)
+        self.assertEqual(out.frame_count(), 50)
+
+    def test_output_is_hard_clipped_to_sample_range(self):
+        # dry signal and a loud echo overlap -> sum exceeds 16-bit range
+        seg = self.segment([30000] * 5 + [0] * 95)
+        out = seg.feedback_delay(
+            delay_ms=2, feedback=0.9, wet=1.0, dry=1.0, max_tail_ms=10)
+        samples = out.get_array_of_samples()
+        self.assertLessEqual(max(samples), 32767)
+        self.assertGreaterEqual(min(samples), -32768)
+        # clipping really happened
+        self.assertIn(32767, list(samples))
+
+    def test_wet_zero_silences_echoes(self):
+        seg = self.pulse(length=50)
+        out = seg.feedback_delay(
+            delay_ms=5, feedback=0.8, wet=0.0, dry=1.0, max_tail_ms=20)
+        samples = out.get_array_of_samples()
+        self.assertEqual(samples[0], 1000)
+        self.assertTrue(all(v == 0 for v in samples[1:]))
+
+    def test_invalid_parameters_raise_value_error(self):
+        seg = self.pulse()
+        bad_kwargs = (
+            {"delay_ms": -1},
+            {"feedback": 1.0},
+            {"feedback": -0.1},
+            {"wet": -1.0},
+            {"dry": -1.0},
+            {"max_tail_ms": -5},
+        )
+        for kwargs in bad_kwargs:
+            with self.assertRaises(ValueError):
+                seg.feedback_delay(**kwargs)
 
 
 class PartialAudioSegmentLoadTests(unittest.TestCase):
